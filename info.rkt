@@ -1,6 +1,8 @@
 #lang info
 (define collection "typed-nanopass")
-(define deps '("base"))
+(define deps '("base"
+               "fancy-app"
+               "ee-lib"))
 (define build-deps '("rackunit-lib"
                      "scribble-lib" "racket-doc"
                      ; coverage
