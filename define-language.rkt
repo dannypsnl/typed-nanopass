@@ -3,9 +3,11 @@
 (require syntax/parse/define
          (for-syntax ee-lib
                      fancy-app
-                     racket/list
                      racket/syntax
                      syntax/stx))
+
+(define-for-syntax (prefix-id prefix id)
+  (format-id id #:source id #:props id "~a:~a" prefix id))
 
 (begin-for-syntax
   (define-syntax-class ty-meta
@@ -45,65 +47,55 @@
     ))
 
 (begin-for-syntax
-  (define/hygienic (meta-variable/bind stx) #:definition
+  (define (meta-variable/bind stx)
     (syntax-parse stx
       [(type (meta:id ...))
        (for-each (bind! _ #'#'type)
                  (syntax->list #'(meta ...)))]))
 
-  (define/hygienic (rule-case/meta-type stx lang name) #:expression
+  (define (rule-case/meta-type stx name)
     (syntax-parse stx
       ; lookup a meta-variable associated type
       [((~literal unquote) meta:id) (lookup #'meta)]
       ; build the struct name
-      [(lead:id c* ...)
-       (format-id #'lead #:source #'lead #:props #'lead
-                  "~a:~a:~a" lang name #'lead)]))
+      [(lead:id c* ...) (prefix-id name #'lead)]))
 
-  (define/hygienic (rule/expand stx lang) #:definition
-    (syntax-parse stx
-      [(name:id (meta:id ...+) c*:rule-case ...+)
-       (for-each (bind! _ #`#'#,(format-id #'name "~a:~a" lang #'name))
-                 (syntax->list #'(meta ...)))
-       (with-syntax ([(ty ...) (stx-map (rule-case/meta-type _ lang #'name) #'(c* ...))])
-         #'(U ty ...))]))
-
-  (define (gen/case-name stx)
-    (syntax-parse stx
-      [(name (_ ...) c*:rule-case ...)
-       (for/list ([c (attribute c*.intro-ty)]
-                  #:when c)
-         (format-id c #:source c #:props c
-                    "~a:~a" #'name c))]))
-
-  (define (gen/case-field stx)
-    (syntax-parse stx
-      [(_ (_ ...) c*:rule-case ...)
-       (filter (λ (stx) (syntax-property stx 'field))
-               (attribute c*.as-field))])))
+  (define (rule/bind stx name)
+    (syntax-parse stx [(meta:id ...) (stx-map (bind! _ #`#'#,name) #'(meta ...))]))
+  (define (rule/expand scoped-stx stx name)
+    (syntax-parse scoped-stx
+      [(scoped-c*:rule-case ...)
+       (with-syntax
+           ([(ty ...) (stx-map (rule-case/meta-type _ name) #'(scoped-c* ...))]
+            [(case-struct ...) (syntax-parse stx
+                                 [(c*:rule-case ...)
+                                  (for/list ([struct-name (attribute c*.intro-ty)]
+                                             [fields (syntax->list #'(scoped-c*.as-field ...))]
+                                             #:when struct-name)
+                                    #`(struct #,(prefix-id name struct-name) #,fields #:transparent))])])
+         #`((define-type #,name (U ty ...)) case-struct ...))])))
 
 (define-syntax-parser define-language
   [(_ lang:id
       (terminals t*:ty-meta ...)
       rules:rule ...)
-   (define (prefix-lang stx) (format-id stx #:source stx #:props stx
-                                        "~a:~a" #'lang stx))
+   (define rule-names (stx-map (prefix-id #'lang _) #'(rules.name ...)))
    (with-scope lang-scope
      (stx-map meta-variable/bind (add-scope #'(t* ...) lang-scope))
+     (stx-map (rule/bind _ _)
+              (add-scope #'((rules.meta ...) ...) lang-scope)
+              rule-names)
      (with-syntax
-         ([(rule-names ...) (stx-map prefix-lang #'(rules.name ...))]
-          [(rule-types^ ...) (stx-map (rule/expand _ #'lang)
-                                      (add-scope #'(rules ...) lang-scope))]
-          [(rule-case-names ...) (map prefix-lang (flatten (stx-map gen/case-name #'(rules ...))))]
-          [(rule-case-fields ...) (flatten (stx-map gen/case-field (add-scope #'(rules ...) lang-scope)))])
+         ([((rule/define-types^ ...) ...)
+           (stx-map (rule/expand _ _ _)
+                    (add-scope #'((rules.case* ...) ...) lang-scope)
+                    #'((rules.case* ...) ...)
+                    rule-names)])
        #'(begin (define lang #'(language lang
                                          (terminals t* ...)
                                          rules ...))
-                (struct rule-case-names
-                  rule-case-fields #:transparent)
-                ...
-                (define-type rule-names rule-types^)
-                ...)))])
+                rule/define-types^
+                ... ...)))])
 
 (module+ test
   (require typed/rackunit)
