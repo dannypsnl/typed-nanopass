@@ -1,11 +1,11 @@
 #lang scribble/manual
 
-@require[@for-label[racket-project
+@require[@for-label[typed-nanopass
                     racket/base]]
 
-@title{racket-project}
+@title{typed-nanopass}
 @author{Lîm Tsú-thuàn}
 
-@defmodule[racket-project]
+@defmodule[typed-nanopass]
 
 Package Description Here

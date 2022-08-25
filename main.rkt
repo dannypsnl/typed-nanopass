@@ -5,7 +5,7 @@
 
   (define who (make-parameter "world"))
   (command-line
-    #:program "racket-project"
+    #:program "typed-nanopass"
     #:once-each
     [("-n" "--name") name "Who to say hello to" (who name)]
     #:args ()
