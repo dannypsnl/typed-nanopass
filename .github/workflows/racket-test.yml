@@ -1,0 +1,39 @@
+name: Racket Test
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  push:
+    branches:
+      - "*"
+    paths:
+      - "**test.yml"
+      - "**.rkt"
+      - "**.scrbl"
+  pull_request:
+    branches:
+      - "*"
+    paths:
+      - "**.rkt"
+      - "**.scrbl"
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        racket-variant: ["BC", "CS"]
+        racket-version: ["stable", "current"]
+    steps:
+      - uses: actions/checkout@master
+      - name: Setup Racket
+        uses: Bogdanp/setup-racket@1.8.1
+        with:
+          architecture: x64
+          distribution: full
+          variant: ${{ matrix.racket-variant }}
+          version: ${{ matrix.racket-version }}
+      - run: raco pkg install --no-docs --auto --skip-installed
+      - run: |
+          raco test -x .
