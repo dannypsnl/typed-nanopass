@@ -53,8 +53,12 @@
 
   (define/hygienic (rule-case/meta-type stx lang name) #:expression
     (syntax-parse stx
+      ; lookup a meta-variable associated type
       [((~literal unquote) meta:id) (lookup #'meta)]
-      [(lead:id c* ...) (format-id #'lead "~a:~a:~a" lang name #'lead)]))
+      ; build the struct name
+      [(lead:id c* ...)
+       (format-id #'lead #:source #'lead #:props #'lead
+                  "~a:~a:~a" lang name #'lead)]))
 
   (define/hygienic (rule/expand stx lang) #:definition
     (syntax-parse stx
@@ -69,7 +73,8 @@
       [(name (_ ...) c*:rule-case ...)
        (for/list ([c (attribute c*.intro-ty)]
                   #:when c)
-         (format-id c "~a:~a" #'name c))]))
+         (format-id c #:source c #:props c
+                    "~a:~a" #'name c))]))
 
   (define (gen/case-field stx)
     (syntax-parse stx
@@ -81,7 +86,8 @@
   [(_ lang:id
       (terminals t*:ty-meta ...)
       rules:rule ...)
-   (define (prefix-lang stx) (format-id stx "~a:~a" #'lang stx))
+   (define (prefix-lang stx) (format-id stx #:source stx #:props stx
+                                        "~a:~a" #'lang stx))
    (with-scope lang-scope
      (stx-map meta-variable/bind (add-scope #'(t* ...) lang-scope))
      (with-syntax
