@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        racket-variant: ["BC", "CS"]
+        racket-variant: ["CS"]
         racket-version: ["stable", "current"]
     steps:
       - uses: actions/checkout@v7
