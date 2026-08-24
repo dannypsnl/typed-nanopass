@@ -26,9 +26,9 @@ jobs:
         racket-variant: ["BC", "CS"]
         racket-version: ["stable", "current"]
     steps:
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v7
       - name: Setup Racket
-        uses: Bogdanp/setup-racket@v1.8.1
+        uses: Bogdanp/setup-racket@v1.15
         with:
           architecture: x64
           distribution: full
