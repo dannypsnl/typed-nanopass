@@ -9,6 +9,13 @@
 (define-for-syntax (prefix-id prefix id)
   (format-id id #:source id #:props id "~a:~a" prefix id))
 
+; `rule-case` is a splicing syntax class: a single repetition may consume more
+; than one raw form (e.g. `,e ...`). Re-templating its bare pattern variable
+; (or `(attribute x)`) as syntax therefore wraps every repetition in an extra
+; list layer; this undoes that wrapping back into one flat list of case forms.
+(define-for-syntax (flatten-rule-cases case*)
+  #`(#,@(apply append (map syntax->list case*))))
+
 (begin-for-syntax
   (define-syntax-class ty-meta
     ; TODO: how to check this is a valid type in typed/racket?
@@ -29,15 +36,30 @@
                       The bind structure will be printed as the right-hand side pretty form
                       |#
                       case*:rule-case ...+)))
-  (define-syntax-class rule-case
+  (define-splicing-syntax-class rule-case
     ; syntax `,x`, which means `x` is a meta variable
-    (pattern (unquote meta:id)
+    ;
+    ; NOTE: must come before the plain leaf pattern below, so `,x ...`
+    ; is recognized as one list-field case instead of a leaf case
+    ; followed by a dangling, unmatchable `...`
+    (pattern (~seq ((~literal unquote) meta:id) (~datum ...))
+      #:attr intro-ty #f
+      #:attr as-field #`[#,(generate-temporary #'meta) : (Listof #,(lookup #'meta))])
+    ; syntax `([,x ,e] ...)`, a list of tuples built from several meta variables,
+    ; e.g. `(let ([,x ,e] ...) ,e)`
+    (pattern ((((~literal unquote) m*:id) ...+) (~datum ...))
+      #:attr intro-ty #f
+      #:attr as-field #`[#,(generate-temporary 'tuple*)
+                          : (Listof (List #,@(stx-map lookup #'(m* ...))))])
+    ; syntax `,x`, which means `x` is a meta variable
+    (pattern ((~literal unquote) meta:id)
       #:attr intro-ty #f
       #:attr as-field #`[#,(generate-temporary #'meta) : #,(lookup #'meta)])
     ; syntax `(+ ,e ,e)`, which means `+` should be a new structure, with fields `([e1 : T] [e2 : T])`
     ; the `T` here is fetching from the language definition
     ;
-    ; TODO: The syntax that nested and with splicing `(let ([,x ,e] ...) ,e)`
+    ; TODO: nested headed forms as a field of another headed form aren't
+    ; flattened correctly yet (as-field below assumes leaf/list-field children)
     (pattern (lead:id c*:rule-case ...+)
       #:attr intro-ty #'lead
       #:attr as-field (syntax-property #'(c*.as-field ...) 'field #t))
@@ -66,7 +88,7 @@
     (syntax-parse scoped-stx
       [(scoped-c*:rule-case ...)
        (with-syntax
-           ([(ty ...) (stx-map (rule-case/meta-type _ name) #'(scoped-c* ...))]
+           ([(ty ...) (stx-map (rule-case/meta-type _ name) (flatten-rule-cases (attribute scoped-c*)))]
             [(case-struct ...) (syntax-parse stx
                                  [(c*:rule-case ...)
                                   (for/list ([struct-name (attribute c*.intro-ty)]
@@ -80,6 +102,13 @@
       (terminals t*:ty-meta ...)
       rules:rule ...)
    (define rule-names (stx-map (prefix-id #'lang _) #'(rules.name ...)))
+   (define all-cases (map flatten-rule-cases (attribute rules.case*)))
+   ; built with quasisyntax + unsyntax-splicing (not a nested `#'` template):
+   ; a rule's source may itself contain a literal `...` (from `,e ...`), and a
+   ; `#'` template nested inside this macro's own `#'` output re-interprets
+   ; every `...` it sees, including ones that are just data, not ellipsis
+   (define lang-descriptor
+     #`(language #,(attribute lang) (terminals #,@(attribute t*)) #,@(attribute rules)))
    (with-scope lang-scope
      (stx-map meta-variable/bind (add-scope #'(t* ...) lang-scope))
      (stx-map (rule/bind _ _)
@@ -88,12 +117,10 @@
      (with-syntax
          ([((rule/define-types^ ...) ...)
            (stx-map (rule/expand _ _ _)
-                    (add-scope #'((rules.case* ...) ...) lang-scope)
-                    #'((rules.case* ...) ...)
+                    (add-scope #`(#,@all-cases) lang-scope)
+                    #`(#,@all-cases)
                     rule-names)])
-       #'(begin (define lang #'(language lang
-                                         (terminals t* ...)
-                                         rules ...))
+       #`(begin (define lang (quote-syntax #,lang-descriptor))
                 rule/define-types^
                 ... ...)))])
 
@@ -108,4 +135,21 @@
           (+ ,e ,e)))
 
   (define a : surface:Expr (surface:Expr:+ 1 2))
-  (check-equal? a a))
+  (check-equal? a a)
+
+  (define-language with-ellipsis
+    (terminals
+     (Integer (n))
+     (Symbol (x)))
+    (Expr (e)
+          ,n
+          (let ([,x ,e] ...) ,e)
+          (block ,e ...)))
+
+  (define b : with-ellipsis:Expr
+    (with-ellipsis:Expr:let (list (list 'x 1) (list 'y 2)) 3))
+  (check-equal? b b)
+
+  (define c : with-ellipsis:Expr
+    (with-ellipsis:Expr:block (list 1 2 3)))
+  (check-equal? c c))
