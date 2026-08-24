@@ -44,17 +44,26 @@
     ; followed by a dangling, unmatchable `...`
     (pattern (~seq ((~literal unquote) meta:id) (~datum ...))
       #:attr intro-ty #f
-      #:attr as-field #`[#,(generate-temporary #'meta) : (Listof #,(lookup #'meta))])
+      #:attr as-field #`[#,(generate-temporary #'meta) : (Listof #,(lookup #'meta))]
+      ; `shape` records this case's field kind for `lang-construct` (see
+      ; construct.rkt): a scalar/list/tuple-list tag plus its field type(s),
+      ; reusing the exact same `lookup` calls `as-field` already uses.
+      #:attr shape #`(list #,(lookup #'meta))
+      #:attr shapes #f)
     ; syntax `([,x ,e] ...)`, a list of tuples built from several meta variables,
     ; e.g. `(let ([,x ,e] ...) ,e)`
     (pattern ((((~literal unquote) m*:id) ...+) (~datum ...))
       #:attr intro-ty #f
       #:attr as-field #`[#,(generate-temporary 'tuple*)
-                          : (Listof (List #,@(stx-map lookup #'(m* ...))))])
+                          : (Listof (List #,@(stx-map lookup #'(m* ...))))]
+      #:attr shape #`(tuple-list #,@(stx-map lookup #'(m* ...)))
+      #:attr shapes #f)
     ; syntax `,x`, which means `x` is a meta variable
     (pattern ((~literal unquote) meta:id)
       #:attr intro-ty #f
-      #:attr as-field #`[#,(generate-temporary #'meta) : #,(lookup #'meta)])
+      #:attr as-field #`[#,(generate-temporary #'meta) : #,(lookup #'meta)]
+      #:attr shape #`(scalar #,(lookup #'meta))
+      #:attr shapes #f)
     ; syntax `(+ ,e ,e)`, which means `+` should be a new structure, with fields `([e1 : T] [e2 : T])`
     ; the `T` here is fetching from the language definition
     ;
@@ -62,7 +71,13 @@
     ; flattened correctly yet (as-field below assumes leaf/list-field children)
     (pattern (lead:id c*:rule-case ...+)
       #:attr intro-ty #'lead
-      #:attr as-field (syntax-property #'(c*.as-field ...) 'field #t))
+      #:attr as-field (syntax-property #'(c*.as-field ...) 'field #t)
+      ; a headed case has no `shape` of its own; `shapes` (one per child,
+      ; reconstructed from the named `.shape` attribute -- safe, unlike
+      ; reconstructing a bare splicing-class pattern variable) is what
+      ; `rule/expand` turns into that case's table entry
+      #:attr shape #f
+      #:attr shapes #'(c*.shape ...))
     ; TODO: please consider the syntax without leading id
     ; for example, we might like to write application just `(,fn ,arg)`
     ; rather than `(app ,fn ,arg) => (,fn ,arg)`
@@ -84,18 +99,29 @@
 
   (define (rule/bind stx name)
     (syntax-parse stx [(meta:id ...) (stx-map (bind! _ #`#'#,name) #'(meta ...))]))
-  (define (rule/expand scoped-stx stx name)
+  ; returns `(cons definitions nt-entry)`: `definitions` is the struct/type
+  ; forms for this rule (as before); `nt-entry` is this rule's slice of the
+  ; `<lang>-meta` table `lang-construct` (construct.rkt) reads back later --
+  ; `(orig-name (lead ctor-id (field-shape ...)) ...)`
+  (define (rule/expand scoped-stx stx name orig-name)
     (syntax-parse scoped-stx
       [(scoped-c*:rule-case ...)
        (with-syntax
            ([(ty ...) (stx-map (rule-case/meta-type _ name) (flatten-rule-cases (attribute scoped-c*)))]
-            [(case-struct ...) (syntax-parse stx
-                                 [(c*:rule-case ...)
-                                  (for/list ([struct-name (attribute c*.intro-ty)]
-                                             [fields (syntax->list #'(scoped-c*.as-field ...))]
-                                             #:when struct-name)
-                                    #`(struct #,(prefix-id name struct-name) #,fields #:transparent))])])
-         #`((define-type #,name (U ty ...)) case-struct ...))])))
+            [((case-struct ...) (case-entry ...))
+             (syntax-parse stx
+               [(c*:rule-case ...)
+                (list
+                 (for/list ([struct-name (attribute c*.intro-ty)]
+                            [fields (syntax->list #'(scoped-c*.as-field ...))]
+                            #:when struct-name)
+                   #`(struct #,(prefix-id name struct-name) #,fields #:transparent))
+                 (for/list ([struct-name (attribute c*.intro-ty)]
+                            [shapes (attribute c*.shapes)]
+                            #:when struct-name)
+                   #`(#,struct-name #,(prefix-id name struct-name) (#,@shapes))))])])
+         (cons #`((define-type #,name (U ty ...)) case-struct ...)
+               #`(#,orig-name case-entry ...)))])))
 
 (define-syntax-parser define-language
   [(_ lang:id
@@ -109,20 +135,29 @@
    ; every `...` it sees, including ones that are just data, not ellipsis
    (define lang-descriptor
      #`(language #,(attribute lang) (terminals #,@(attribute t*)) #,@(attribute rules)))
+   ; `<lang>-meta` (a compile-time-only binding, looked up via
+   ; `syntax-local-value` by construct.rkt's `lang-construct`) holds the
+   ; `(nt-entry ...)` table described above `rule/expand`. Bound under a name
+   ; derived from `lang`, since `lang` itself is already a runtime binding.
+   (define meta-id (format-id #'lang "~a-meta" #'lang))
    (with-scope lang-scope
      (stx-map meta-variable/bind (add-scope #'(t* ...) lang-scope))
      (stx-map (rule/bind _ _)
               (add-scope #'((rules.meta ...) ...) lang-scope)
               rule-names)
-     (with-syntax
-         ([((rule/define-types^ ...) ...)
-           (stx-map (rule/expand _ _ _)
-                    (add-scope #`(#,@all-cases) lang-scope)
-                    #`(#,@all-cases)
-                    rule-names)])
-       #`(begin (define lang (quote-syntax #,lang-descriptor))
-                rule/define-types^
-                ... ...)))])
+     (define rule-results
+       (stx-map (rule/expand _ _ _ _)
+                (add-scope #`(#,@all-cases) lang-scope)
+                #`(#,@all-cases)
+                rule-names
+                (attribute rules.name)))
+     ; flattened the same way `all-cases` is: each result's `car` is itself a
+     ; syntax LIST of definitions for that rule, not a single definition
+     (define rule-defs (apply append (map (lambda (r) (syntax->list (car r))) rule-results)))
+     (define meta-table #`(#,@(map cdr rule-results)))
+     #`(begin (define lang (quote-syntax #,lang-descriptor))
+              (define-syntax #,meta-id (quote-syntax #,meta-table))
+              #,@rule-defs))])
 
 (module+ test
   (require typed/rackunit)
