@@ -122,6 +122,17 @@
          (cons #`((define-type #,name (U ty ...)) case-struct ...)
                #`(#,orig-name (case-entry ...) (leaf-type ...))))])))
 
+(begin-for-syntax
+  (define (ext-nt-entry-name entry) (syntax-parse entry [(name:id _ _) #'name]))
+  (define (ext-nt-entry-cases entry) (syntax-parse entry [(_ (ce ...) _) (syntax->list #'(ce ...))]))
+  (define (ext-nt-entry-leaf-types entry) (syntax-parse entry [(_ _ (lt ...)) (syntax->list #'(lt ...))]))
+  (define (ext-case-entry-lead ce) (syntax-parse ce [(lead:id _ _) (syntax-e #'lead)]))
+  (define (ext-case-entry-ctor ce) (syntax-parse ce [(_ ctor:id _) #'ctor]))
+
+  (define-syntax-class extend-delta
+    (pattern (nt-name:id ((~datum -) rm:id ...))
+      #:attr removed (syntax->list #'(rm ...)))))
+
 (define-syntax-parser define-language
   [(_ lang:id
       (terminals t*:ty-meta ...)
@@ -151,9 +162,73 @@
      ; syntax LIST of definitions for that rule, not a single definition
      (define rule-defs (apply append (map (lambda (r) (syntax->list (car r))) rule-results)))
      (define meta-table #`(#,@(map cdr rule-results)))
+     (define extends-id (format-id #'lang "~a-extends" #'lang))
      #`(begin (define lang (quote-syntax #,lang-descriptor))
          (define-syntax #,meta-id (quote-syntax #,meta-table))
-         #,@rule-defs))])
+         (define-syntax #,extends-id (quote-syntax #f))
+         #,@rule-defs))]
+  ; `(define-language Child (extends Parent) (NT (- lead ...)) ...)`
+  ;
+  ; Every nonterminal Child doesn't mention is inherited from Parent
+  ; wholesale -- same ctor-ids, same struct types, not redefined -- so an
+  ; untouched case is literally the same value in both languages, not a
+  ; structurally-similar lookalike that happens to share a name. `(- lead
+  ; ...)` drops named cases from an inherited nonterminal (e.g. a surface
+  ; construct a lowering pass desugars away); MVP has no way to add cases,
+  ; only remove them.
+  ;
+  ; This is what makes r/match*'s `#:auto` (recur-match.rkt) trustworthy:
+  ; it doesn't guess correspondence between #:lang and #:to by matching
+  ; names across two independently-authored languages -- it requires #:to
+  ; to (transitively) extend #:lang, then reads back exactly the cases
+  ; `extends` already carried over.
+  [(_ lang:id ((~literal extends) parent:id) delta:extend-delta ...)
+   (define parent-meta-id (format-id #'parent "~a-meta" #'parent))
+   (define parent-table (syntax-local-value parent-meta-id (lambda () #f)))
+   (unless parent-table
+     (raise-syntax-error 'define-language (format "no such language: ~a" (syntax-e #'parent)) #'parent))
+   (define parent-entries (syntax->list parent-table))
+   (for ([nm (in-list (attribute delta.nt-name))])
+     (unless (for/or ([e (in-list parent-entries)]) (eq? (syntax-e (ext-nt-entry-name e)) (syntax-e nm)))
+       (raise-syntax-error 'define-language
+                           (format "~a has no nonterminal ~a" (syntax-e #'parent) (syntax-e nm))
+                           nm)))
+   (define (removed-leads-for nt-sym)
+     (or (for/or ([nm (in-list (attribute delta.nt-name))] [rm (in-list (attribute delta.removed))])
+           (and (eq? (syntax-e nm) nt-sym) (map syntax-e rm)))
+         '()))
+   (define new-entries
+     (for/list ([entry (in-list parent-entries)])
+       (define nt-name (ext-nt-entry-name entry))
+       (define remove-set (removed-leads-for (syntax-e nt-name)))
+       (define all-cases (ext-nt-entry-cases entry))
+       (for ([sym (in-list remove-set)])
+         (unless (memq sym (map ext-case-entry-lead all-cases))
+           (raise-syntax-error 'define-language
+                               (format "~a's ~a has no case ~a to remove" (syntax-e #'parent) (syntax-e nt-name) sym)
+                               #'lang)))
+       (define kept (for/list ([ce (in-list all-cases)] #:unless (memq (ext-case-entry-lead ce) remove-set)) ce))
+       #`(#,nt-name (#,@kept) (#,@(ext-nt-entry-leaf-types entry)))))
+   (define type-defs
+     (for/list ([entry (in-list new-entries)])
+       (syntax-parse entry
+         [(nt-name:id (ce ...) (lt ...))
+          (define ctor-types (for/list ([ce (in-list (syntax->list #'(ce ...)))]) (ext-case-entry-ctor ce)))
+          ; NOT `(prefix-id #'lang #'nt-name)`: prefix-id's hygiene context
+          ; comes from its 2nd argument, and nt-name here was extracted from
+          ; Parent's meta table, not from this macro's own input -- using it
+          ; as context would make the resulting `Child:NT` identifier carry
+          ; Parent's expansion history instead of Child's, so a plain
+          ; `Child:NT` reference written by the user wouldn't resolve to it.
+          ; Context must come from `lang` (this clause's own `lang:id`).
+          #`(define-type #,(format-id #'lang "~a:~a" (syntax-e #'lang) (syntax-e #'nt-name))
+              (U #,@ctor-types #,@(syntax->list #'(lt ...))))])))
+   (define meta-id (format-id #'lang "~a-meta" #'lang))
+   (define extends-id (format-id #'lang "~a-extends" #'lang))
+   #`(begin
+       (define-syntax #,meta-id (quote-syntax (#,@new-entries)))
+       (define-syntax #,extends-id (quote-syntax parent))
+       #,@type-defs)])
 
 (module+ test
   (require typed/rackunit)
