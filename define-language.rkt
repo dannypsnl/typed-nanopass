@@ -59,9 +59,16 @@
       #:attr shapes #f)
     ; `(+ ,e ,e)` -- `+` becomes a struct with fields `([e1 : T] [e2 : T])`
     ;
-    ; TODO: nested headed forms as a field of another headed form aren't
-    ; flattened correctly yet (as-field below assumes leaf/list-field children)
+    ; a headed rule-case's own children must be leaf/list/tuple-list
+    ; pieces, not another headed form (`as-field` below assumes exactly
+    ; that shape) -- without this guard a grammar like `(Neg (Add ,e ,e))`
+    ; doesn't fail cleanly, it crashes deep inside syntax-parse pointing at
+    ; a line in this file instead of the offending rule. Nesting terms is
+    ; still fine everywhere else (e.g. `(lang-construct L Expr `(Neg (Add
+    ; ,l ,r)))`); it's only unsupported as a *grammar case's own field*.
     (pattern (lead:id c*:rule-case ...+)
+      #:fail-when (ormap values (attribute c*.intro-ty))
+                  "nested headed form as a field of another case isn't supported yet -- give it its own top-level case and reference it through a meta-variable instead"
       #:attr intro-ty #'lead
       #:attr as-field (syntax-property #'(c*.as-field ...) 'field #t)
       #:attr shape #f
@@ -314,7 +321,7 @@
        #,(build-lang->sexp-def sexp-id new-table (syntax-e #'lang)))])
 
 (module+ test
-  (require typed/rackunit)
+  (require typed/rackunit syntax/macro-testing)
 
   (define-language surface
     (terminals
@@ -352,4 +359,13 @@
 
   (define-language core (extends with-ellipsis) (Expr (- let)))
   (define d : core:Expr (with-ellipsis:Expr:block (list 1 2 3)))
-  (check-equal? (core->sexp d) '(block 1 2 3)))
+  (check-equal? (core->sexp d) '(block 1 2 3))
+
+  ; a headed rule-case's own field can't be another headed form -- must fail
+  ; at the offending grammar, not crash inside syntax-parse's internals
+  (check-exn #rx"nested headed form as a field"
+    (lambda ()
+      (convert-compile-time-error
+        (define-language Bad-Nested
+          (terminals (Integer (n)))
+          (Expr (e) ,n (Add ,e ,e) (Neg (Add ,e ,e))))))))
