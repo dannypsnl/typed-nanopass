@@ -86,17 +86,6 @@
   (interp-instr program env)
   (hash-ref env (reg 0)))
 
-(: instr->sexp : Asm:Instr -> Any)
-(define (instr->sexp i)
-  (r/match* i
-    #:lang Asm
-    #:on instr->sexp
-    [(mov ,r ,n) (list 'mov r n)]
-    [(movr ,dst ,src) (list 'mov dst src)]
-    [(add ,dst ,src) (list 'add dst src)]
-    [(mul ,dst ,src) (list 'mul dst src)]
-    [(block ,[is] ...) (cons 'block is)]))
-
 (module+ test
   (require typed/rackunit)
 
@@ -129,5 +118,5 @@
     (lang-construct Arith Expr `(Add (Mul ,2 ,3) (Add (Var ,'x) ,0))))
   (define asm (compile-arith e))
   (printf "source: (2 * 3) + (x + 0)\n")
-  (printf "asm:    ~a\n" (instr->sexp asm))
+  (printf "asm:    ~a\n" (Asm->sexp asm))
   (printf "result: ~a\n" (run-compiled asm (hash 'x 10))))

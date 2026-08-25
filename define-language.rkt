@@ -1,6 +1,6 @@
 #lang typed/racket
 (provide define-language)
-(require syntax/parse/define
+(require syntax/parse/define racket/match
          (for-syntax ee-lib
                      fancy-app
                      racket/syntax
@@ -133,6 +133,81 @@
     (pattern (nt-name:id ((~datum -) rm:id ...))
       #:attr removed (syntax->list #'(rm ...)))))
 
+; unparser
+(begin-for-syntax
+  (define (sx-case-entry-parts ce)
+    (syntax-parse ce [(lead:id ctor:id (fs ...)) (values #'lead #'ctor (syntax->list #'(fs ...)))]))
+  (define (sx-field-shape-tag fs) (syntax-e (car (syntax->list fs))))
+  (define (sx-field-shape-rest fs) (cdr (syntax->list fs))) ; scalar/list: 1 type; tuple-list: N types
+
+  ; every `lang:NT` full type name this language declares, as bare symbols --
+  ; distinguishes "this field recurses" from "this field is a terminal, copy
+  ; it as-is" (mirrors recur-match.rkt's #:auto machinery)
+  (define (sx-source-nt-syms lang-sym table)
+    (for/list ([nt-entry (in-list (syntax->list table))])
+      (string->symbol (format "~a:~a" lang-sym (syntax-e (ext-nt-entry-name nt-entry))))))
+
+  (define (sx-nonterminal-type? type-id nt-syms) (and (memq (syntax-e type-id) nt-syms) #t))
+
+  ; a field's contribution to the printed form, meant to be spliced together
+  ; with `append`: scalar/tuple-list contribute a single-element list (their
+  ; one converted value/sub-list), list contributes its whole converted list
+  ; directly -- so `,i ...`'s elements land as siblings of the lead symbol,
+  ; same shape the grammar rule itself was written in.
+  (define (sx-scalar-part v ty nt-syms self-id)
+    (if (sx-nonterminal-type? ty nt-syms) #`(list (#,self-id #,v)) #`(list #,v)))
+  (define (sx-list-part v ty nt-syms self-id)
+    (if (sx-nonterminal-type? ty nt-syms) #`(map #,self-id #,v) v))
+  ; `for/list`'s element binding needs an explicit type annotation here: when
+  ; `v`'s own type comes from narrowing an outer `Any` via a struct match
+  ; pattern (as it does in sx-build-case-clause below), Typed Racket's
+  ; inference loses track of `one`'s type through the nested `match`, and
+  ; mis-signals the whole `for/list` as producing zero-or-multiple values
+  ; instead of one.
+  (define (sx-tuple-list-part v tys nt-syms self-id)
+    (define comps (for/list ([_ (in-list tys)]) (generate-temporary 'c)))
+    (define converted
+      (for/list ([c (in-list comps)] [ty (in-list tys)])
+        (if (sx-nonterminal-type? ty nt-syms) #`(#,self-id #,c) c)))
+    #`(list (for/list : (Listof Any) ([one : (List #,@tys) (in-list #,v)])
+              (match one [(list #,@comps) (list #,@converted)]))))
+
+  ; one `[(Ctor f ...) (append (list 'lead) part ...)]` match clause
+  (define (sx-build-case-clause ce nt-syms self-id)
+    (define-values (lead ctor field-shapes) (sx-case-entry-parts ce))
+    (define field-vars (for/list ([_ (in-list field-shapes)]) (generate-temporary 'f)))
+    (define parts
+      (for/list ([fs (in-list field-shapes)] [v (in-list field-vars)])
+        (define rest (sx-field-shape-rest fs))
+        (case (sx-field-shape-tag fs)
+          [(scalar) (sx-scalar-part v (car rest) nt-syms self-id)]
+          [(list) (sx-list-part v (car rest) nt-syms self-id)]
+          [(tuple-list) (sx-tuple-list-part v rest nt-syms self-id)])))
+    #`[(#,ctor #,@field-vars) (append (list (quote #,lead)) #,@parts)])
+
+  ; (build-lang->sexp-def name-id table lang-sym) -> syntax
+  ;
+  ; `name-id : Any -> Any`, matching every case of every nonterminal `table`
+  ; (a language's `<lang>-meta` table) declares, and reconstructing the plain
+  ; s-expression that would rebuild it via `lang-construct` -- `(lead field
+  ; ...)`, recursing into nonterminal-typed fields via `name-id` itself and
+  ; copying terminal-typed fields as-is. A case's own lead name is always
+  ; what gets printed; there's no per-case custom pretty name/abbreviation
+  ; (write that by hand, e.g. via a plain `r/match*` pass, when one's
+  ; wanted).
+  (define (build-lang->sexp-def name-id table lang-sym)
+    (define nt-syms (sx-source-nt-syms lang-sym table))
+    (define clauses
+      (for*/list ([nt-entry (in-list (syntax->list table))]
+                  [ce (in-list (ext-nt-entry-cases nt-entry))])
+        (sx-build-case-clause ce nt-syms name-id)))
+    #`(begin
+        (: #,name-id : Any -> Any)
+        (define (#,name-id x)
+          (match x
+            #,@clauses
+            [_ x])))))
+
 (define-syntax-parser define-language
   [(_ lang:id
       (terminals t*:ty-meta ...)
@@ -163,10 +238,15 @@
      (define rule-defs (apply append (map (lambda (r) (syntax->list (car r))) rule-results)))
      (define meta-table #`(#,@(map cdr rule-results)))
      (define extends-id (format-id #'lang "~a-extends" #'lang))
+     ; every language gets a printer for free -- `<lang>->sexp`, the inverse
+     ; of `lang-construct` (see sexp-gen.rkt); nanopass-framework's unparser
+     ; is the equivalent this mirrors
+     (define sexp-id (format-id #'lang "~a->sexp" #'lang))
      #`(begin (define lang (quote-syntax #,lang-descriptor))
          (define-syntax #,meta-id (quote-syntax #,meta-table))
          (define-syntax #,extends-id (quote-syntax #f))
-         #,@rule-defs))]
+         #,@rule-defs
+         #,(build-lang->sexp-def sexp-id meta-table (syntax-e #'lang))))]
   ; `(define-language Child (extends Parent) (NT (- lead ...)) ...)`
   ;
   ; Every nonterminal Child doesn't mention is inherited from Parent
@@ -225,10 +305,13 @@
               (U #,@ctor-types #,@(syntax->list #'(lt ...))))])))
    (define meta-id (format-id #'lang "~a-meta" #'lang))
    (define extends-id (format-id #'lang "~a-extends" #'lang))
+   (define sexp-id (format-id #'lang "~a->sexp" #'lang))
+   (define new-table #`(#,@new-entries))
    #`(begin
        (define-syntax #,meta-id (quote-syntax (#,@new-entries)))
        (define-syntax #,extends-id (quote-syntax parent))
-       #,@type-defs)])
+       #,@type-defs
+       #,(build-lang->sexp-def sexp-id new-table (syntax-e #'lang)))])
 
 (module+ test
   (require typed/rackunit)
@@ -242,6 +325,10 @@
 
   (define a : surface:Expr (surface:Expr:+ 1 2))
   (check-equal? a a)
+  ; every language gets `<lang>->sexp` for free -- no boilerplate `r/match*`
+  ; pass needed just to print a term back as an s-expression
+  (check-equal? (surface->sexp a) '(+ 1 2))
+  (check-equal? (surface->sexp 5) 5)
 
   (define-language with-ellipsis
     (terminals
@@ -258,4 +345,11 @@
 
   (define c : with-ellipsis:Expr
     (with-ellipsis:Expr:block (list 1 2 3)))
-  (check-equal? c c))
+  (check-equal? c c)
+
+  (check-equal? (with-ellipsis->sexp b) '(let ((x 1) (y 2)) 3))
+  (check-equal? (with-ellipsis->sexp c) '(block 1 2 3))
+
+  (define-language core (extends with-ellipsis) (Expr (- let)))
+  (define d : core:Expr (with-ellipsis:Expr:block (list 1 2 3)))
+  (check-equal? (core->sexp d) '(block 1 2 3)))

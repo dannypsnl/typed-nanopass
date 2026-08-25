@@ -110,17 +110,6 @@
   (interp-instr program env)
   (hash-ref env (reg 0)))
 
-(: instr->sexp : Asm:Instr -> Any)
-(define (instr->sexp i)
-  (r/match* i
-    #:lang Asm
-    #:on instr->sexp
-    [(mov ,r ,n) (list 'mov r n)]
-    [(movr ,dst ,src) (list 'mov dst src)]
-    [(add ,dst ,src) (list 'add dst src)]
-    [(mul ,dst ,src) (list 'mul dst src)]
-    [(block ,[is] ...) (cons 'block is)]))
-
 (module+ test
   (require typed/rackunit)
 
@@ -147,6 +136,6 @@
   (define core (desugar-sub e))
   (define asm (compile-core core))
   (printf "surface: (x - 5) * (3 - x)\n")
-  (printf "asm:     ~a\n" (instr->sexp asm))
+  (printf "asm:     ~a\n" (Asm->sexp asm))
   (define x 7)
   (printf "With x = ~a, result = ~a\n" x (run-compiled asm (hash 'x x))))
