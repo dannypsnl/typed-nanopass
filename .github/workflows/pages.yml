@@ -1,0 +1,61 @@
+name: Deploy Pages
+on:
+  push:
+    branches:
+      - "main"
+    paths:
+      - "**.rkt"
+      - "**.scrbl"
+      - ".github/workflows/pages.yml"
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Racket
+        uses: Bogdanp/setup-racket@v1.15
+        with:
+          architecture: x64
+          distribution: full
+          variant: "CS"
+          version: "stable"
+          packages: "cover, cover-badge"
+      - run: raco pkg install --no-docs --auto --skip-installed
+      - name: Build docs
+        run: |
+          mkdir -p site
+          raco scribble --htmls +m --redirect-main https://docs.racket-lang.org/ --dest _doc-build scribblings/typed-nanopass.scrbl
+          cp -r _doc-build/typed-nanopass/. site/
+      - name: Build coverage report
+        run: |
+          raco cover -b .
+          raco cover-badge
+          mkdir -p site/coverage
+          cp -r coverage/. site/coverage/
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

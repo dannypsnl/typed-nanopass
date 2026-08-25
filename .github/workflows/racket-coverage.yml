@@ -33,10 +33,3 @@ jobs:
       - run: |
           raco cover -b .
           raco cover-badge
-      - name: Deploy
-        uses: peaceiris/actions-gh-pages@v4.1.0
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: coverage
-          publish_branch: gh-pages
-          destination_dir: coverage
