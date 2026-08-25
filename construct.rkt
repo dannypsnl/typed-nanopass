@@ -32,9 +32,13 @@
 
   ; the `<lang>-meta` table (built by define-language.rkt's `rule/expand`) is
   ;   (nt-entry ...)
-  ;   nt-entry    ::= (nt-name-id case-entry ...)
+  ;   nt-entry    ::= (nt-name-id (case-entry ...) (leaf-type ...))
   ;   case-entry  ::= (lead-id ctor-id (field-shape ...))
   ;   field-shape ::= (scalar type) | (list type) | (tuple-list type ...)
+  ; `leaf-type` (one per bare top-level `,x` grammar alternative, e.g. `,n`)
+  ; isn't used here -- `lang-construct` only ever builds headed cases, since
+  ; a leaf value is already usable directly wherever the nonterminal's type
+  ; is expected -- but `r/match*` (recur-match.rkt) needs it.
   ; `lead`/`nt-name`/the shape tags are plain labels, not bound identifiers,
   ; so they're compared by symbol (`syntax-e`), never by hygiene -- comparing
   ; via `~literal`/`bound-id=?` would be wrong here (and would fail across
@@ -47,7 +51,7 @@
 
   (define (find-case-entry nt-entry lead-sym)
     (syntax-parse nt-entry
-      [(_ ce ...)
+      [(_ (ce ...) _)
        (for/or ([ce (in-list (syntax->list #'(ce ...)))])
          (syntax-parse ce
            [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) ce)]))]))
@@ -90,8 +94,8 @@
              (define-values (kind val) (parse-piece (car pieces)))
              (unless (eq? kind 'splice)
                (raise-syntax-error 'lang-construct
-                                    "a list field before other fields needs `,@expr`"
-                                    (car pieces)))
+                                   "a list field before other fields needs `,@expr`"
+                                   (car pieces)))
              (cons val (consume-fields rest-shapes (cdr pieces) case-stx))]
             [(and (pair? pieces) (null? (cdr pieces)))
              ; last field, exactly one piece left: either spelling is fine
@@ -111,8 +115,8 @@
                  (define-values (kind val) (parse-piece p))
                  (unless (eq? kind 'scalar)
                    (raise-syntax-error 'lang-construct
-                                        "expected `,expr` (a single `,@expr` can't be mixed with other pieces here)"
-                                        p))
+                                       "expected `,expr` (a single `,@expr` can't be mixed with other pieces here)"
+                                       p))
                  val))
              (list #`(list #,@vals))])]
          [(tuple-list)
@@ -127,21 +131,21 @@
                (define tuples (syntax->list (car pieces)))
                (unless tuples
                  (raise-syntax-error 'lang-construct
-                                      "expected `,@expr` or a `[...]` list of tuples"
-                                      (car pieces)))
+                                     "expected `,@expr` or a `[...]` list of tuples"
+                                     (car pieces)))
                #`(list #,@(for/list ([t (in-list tuples)])
                             (define elems (parse-tuple-template t))
                             (unless (= (length elems) arity)
                               (raise-syntax-error 'lang-construct
-                                                   (format "tuple has ~a element~a, field expects ~a"
-                                                           (length elems)
-                                                           (if (= 1 (length elems)) "" "s")
-                                                           arity)
-                                                   t))
+                                                  (format "tuple has ~a element~a, field expects ~a"
+                                                          (length elems)
+                                                          (if (= 1 (length elems)) "" "s")
+                                                          arity)
+                                                  t))
                             #`(list #,@elems)))]
               [else (raise-syntax-error 'lang-construct
-                                         "expected `,@expr` or a `[...]` list of tuples"
-                                         (car pieces))]))
+                                        "expected `,@expr` or a `[...]` list of tuples"
+                                        (car pieces))]))
           (cons arg (consume-fields rest-shapes (cdr pieces) case-stx))])])))
 
 ; (lang-construct lang-id nt-id `(lead piece ...))
@@ -165,18 +169,18 @@
    (define table (syntax-local-value meta-id (lambda () #f)))
    (unless table
      (raise-syntax-error 'lang-construct
-                          (format "no such language: ~a" (syntax-e #'lang-id))
-                          #'lang-id))
+                         (format "no such language: ~a" (syntax-e #'lang-id))
+                         #'lang-id))
    (define nt-entry (find-nt-entry table (syntax-e #'nt-id)))
    (unless nt-entry
      (raise-syntax-error 'lang-construct
-                          (format "~a has no nonterminal ~a" (syntax-e #'lang-id) (syntax-e #'nt-id))
-                          #'nt-id))
+                         (format "~a has no nonterminal ~a" (syntax-e #'lang-id) (syntax-e #'nt-id))
+                         #'nt-id))
    (define case-entry (find-case-entry nt-entry (syntax-e #'lead)))
    (unless case-entry
      (raise-syntax-error 'lang-construct
-                          (format "~a's ~a has no case ~a" (syntax-e #'lang-id) (syntax-e #'nt-id) (syntax-e #'lead))
-                          #'lead))
+                         (format "~a's ~a has no case ~a" (syntax-e #'lang-id) (syntax-e #'nt-id) (syntax-e #'lead))
+                         #'lead))
    (define-values (ctor-id field-shapes)
      (syntax-parse case-entry
        [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
@@ -188,7 +192,7 @@
 
   (define-language surface
     (terminals
-     (Integer (n)))
+      (Integer (n)))
     (Expr (e)
           ,n
           (+ ,e ,e)))
@@ -198,8 +202,8 @@
 
   (define-language with-ellipsis
     (terminals
-     (Integer (n))
-     (Symbol (x)))
+      (Integer (n))
+      (Symbol (x)))
     (Expr (e)
           ,n
           (let ([,x ,e] ...) ,e)

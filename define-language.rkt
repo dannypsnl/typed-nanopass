@@ -55,7 +55,7 @@
     (pattern ((((~literal unquote) m*:id) ...+) (~datum ...))
       #:attr intro-ty #f
       #:attr as-field #`[#,(generate-temporary 'tuple*)
-                          : (Listof (List #,@(stx-map lookup #'(m* ...))))]
+                         : (Listof (List #,@(stx-map lookup #'(m* ...))))]
       #:attr shape #`(tuple-list #,@(stx-map lookup #'(m* ...)))
       #:attr shapes #f)
     ; syntax `,x`, which means `x` is a meta variable
@@ -101,27 +101,43 @@
     (syntax-parse stx [(meta:id ...) (stx-map (bind! _ #`#'#,name) #'(meta ...))]))
   ; returns `(cons definitions nt-entry)`: `definitions` is the struct/type
   ; forms for this rule (as before); `nt-entry` is this rule's slice of the
-  ; `<lang>-meta` table `lang-construct` (construct.rkt) reads back later --
-  ; `(orig-name (lead ctor-id (field-shape ...)) ...)`
+  ; `<lang>-meta` table both `lang-construct` (construct.rkt) and `r/match*`
+  ; (recur-match.rkt) read back later --
+  ; `(orig-name ((lead ctor-id (field-shape ...)) ...) (leaf-type ...))`
+  ; `leaf-type` collects the type of each top-level bare `,x` alternative
+  ; (e.g. `,n` in `(Expr (e) ,n (Add ,e ,e))`) -- these don't get a struct or
+  ; a case-entry, but `r/match*` needs their type to narrow a leaf clause's
+  ; binding, which a bare match pattern variable can't do on its own.
   (define (rule/expand scoped-stx stx name orig-name)
     (syntax-parse scoped-stx
       [(scoped-c*:rule-case ...)
        (with-syntax
-           ([(ty ...) (stx-map (rule-case/meta-type _ name) (flatten-rule-cases (attribute scoped-c*)))]
-            [((case-struct ...) (case-entry ...))
-             (syntax-parse stx
-               [(c*:rule-case ...)
-                (list
-                 (for/list ([struct-name (attribute c*.intro-ty)]
-                            [fields (syntax->list #'(scoped-c*.as-field ...))]
-                            #:when struct-name)
-                   #`(struct #,(prefix-id name struct-name) #,fields #:transparent))
-                 (for/list ([struct-name (attribute c*.intro-ty)]
-                            [shapes (attribute c*.shapes)]
-                            #:when struct-name)
-                   #`(#,struct-name #,(prefix-id name struct-name) (#,@shapes))))])])
+         ([(ty ...) (stx-map (rule-case/meta-type _ name) (flatten-rule-cases (attribute scoped-c*)))]
+          [((case-struct ...) (case-entry ...) (leaf-type ...))
+           (syntax-parse stx
+             [(c*:rule-case ...)
+              (list
+                (for/list ([struct-name (attribute c*.intro-ty)]
+                           [fields (syntax->list #'(scoped-c*.as-field ...))]
+                           #:when struct-name)
+                  #`(struct #,(prefix-id name struct-name) #,fields #:transparent))
+                ; `shapes`/`shape` must come from `scoped-c*`, not `c*` --
+                ; they call `lookup` internally (same as `as-field` above),
+                ; which only resolves against scoped identifiers
+                (for/list ([struct-name (attribute c*.intro-ty)]
+                           [shapes (attribute scoped-c*.shapes)]
+                           #:when struct-name)
+                  #`(#,struct-name #,(prefix-id name struct-name) (#,@shapes)))
+                (for/list ([struct-name (attribute c*.intro-ty)]
+                           [shape (attribute scoped-c*.shape)]
+                           #:when (not struct-name)
+                           #:when shape
+                           #:when (syntax-parse shape
+                                    [(tag:id _) (eq? (syntax-e #'tag) 'scalar)]
+                                    [_ #f]))
+                  (syntax-parse shape [(_ t) #'t])))])])
          (cons #`((define-type #,name (U ty ...)) case-struct ...)
-               #`(#,orig-name case-entry ...)))])))
+               #`(#,orig-name (case-entry ...) (leaf-type ...))))])))
 
 (define-syntax-parser define-language
   [(_ lang:id
@@ -156,15 +172,15 @@
      (define rule-defs (apply append (map (lambda (r) (syntax->list (car r))) rule-results)))
      (define meta-table #`(#,@(map cdr rule-results)))
      #`(begin (define lang (quote-syntax #,lang-descriptor))
-              (define-syntax #,meta-id (quote-syntax #,meta-table))
-              #,@rule-defs))])
+         (define-syntax #,meta-id (quote-syntax #,meta-table))
+         #,@rule-defs))])
 
 (module+ test
   (require typed/rackunit)
 
   (define-language surface
     (terminals
-     (Integer (n)))
+      (Integer (n)))
     (Expr (e)
           ,n
           (+ ,e ,e)))
@@ -174,8 +190,8 @@
 
   (define-language with-ellipsis
     (terminals
-     (Integer (n))
-     (Symbol (x)))
+      (Integer (n))
+      (Symbol (x)))
     (Expr (e)
           ,n
           (let ([,x ,e] ...) ,e)
