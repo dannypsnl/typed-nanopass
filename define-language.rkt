@@ -246,12 +246,24 @@
      (define meta-table #`(#,@(map cdr rule-results)))
      (define extends-id (format-id #'lang "~a-extends" #'lang))
      ; every language gets a printer for free -- `<lang>->sexp`, the inverse
-     ; of `lang-construct` (see sexp-gen.rkt); nanopass-framework's unparser
-     ; is the equivalent this mirrors
+     ; of `lang-construct`; nanopass-framework's unparser is the equivalent
+     ; this mirrors (see the `unparser` begin-for-syntax block above)
      (define sexp-id (format-id #'lang "~a->sexp" #'lang))
+     ; a terminal type only gets typechecked by virtue of landing in a
+     ; generated struct field/leaf-type union -- which only happens if some
+     ; rule actually uses one of its meta-variables. A terminal declared but
+     ; never referenced by any rule (typo'd meta-variable name, dead
+     ; leftover, ...) would otherwise compile silently with a bogus type.
+     ; Force every declared terminal type through Typed Racket's own checker
+     ; regardless of use, same "let TR check it" approach the rest of this
+     ; file already relies on instead of hand-rolled validation.
+     (define terminal-checks
+       (for/list ([ty (in-list (attribute t*.type))])
+         #`(define-type #,(generate-temporary 'terminal-check) #,ty)))
      #`(begin (define lang (quote-syntax #,lang-descriptor))
          (define-syntax #,meta-id (quote-syntax #,meta-table))
          (define-syntax #,extends-id (quote-syntax #f))
+         #,@terminal-checks
          #,@rule-defs
          #,(build-lang->sexp-def sexp-id meta-table (syntax-e #'lang))))]
   ; `(define-language Child (extends Parent) (NT (- lead ...)) ...)`
