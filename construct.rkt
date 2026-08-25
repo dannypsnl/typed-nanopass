@@ -5,21 +5,16 @@
                      syntax/stx))
 
 (begin-for-syntax
-  ; classifies one raw quasiquote piece:
-  ;   'scalar + the wrapped expr,  for `,expr`
-  ;   'splice + the wrapped expr,  for `,@expr`
-  ;   'raw    + the piece itself,  for anything else (e.g. a `[...]` bracket
-  ;                                 literal, which is bare syntax, not
-  ;                                 `,`/`,@`-headed)
+  ; classifies one raw quasiquote piece: 'scalar/'splice wrap the expr
+  ; (`,expr`/`,@expr`); 'raw is anything else (e.g. a `[...]` bracket literal)
   (define (parse-piece p)
     (syntax-parse p
       [((~literal unquote) e:expr) (values 'scalar #'e)]
       [((~literal unquote-splicing) e:expr) (values 'splice #'e)]
       [_ (values 'raw p)]))
 
-  ; one tuple inside a tuple-list bracket literal, e.g. the `[,'x ,1]` in
-  ; `([,'x ,1] [,'y ,2])` -- a bare list whose every element is resolved the
-  ; same way a scalar field's piece is (see `resolve-piece-expr`)
+  ; one tuple in a tuple-list bracket literal, e.g. `[,'x ,1]` in
+  ; `([,'x ,1] [,'y ,2])` -- each element resolved via resolve-piece-expr
   (define (parse-tuple-template table t)
     (syntax-parse t
       [(p ...)
@@ -27,11 +22,8 @@
          (resolve-piece-expr table one))]
       [_ (raise-syntax-error 'lang-construct "expected a tuple `[,x ,e ...]`" t)]))
 
-  ; searches every nonterminal's case-entries in `table` for one named
-  ; `lead-sym` -- used to resolve a *nested* shape, e.g. the `(Mul ,2 ,3)`
-  ; inside `(Add (Mul ,2 ,3) ,r)`, whose nonterminal isn't known up front the
-  ; way the outermost call's `nt-id` argument is (mirrors recur-match.rkt's
-  ; `find-case-entry-anywhere`)
+  ; a nested shape's nonterminal isn't known up front, unlike the outermost
+  ; call's nt-id, so search every nonterminal for the lead-id
   (define (find-case-entry-anywhere table lead-sym)
     (for/or ([nt-entry (in-list (syntax->list table))])
       (syntax-parse nt-entry
@@ -40,9 +32,8 @@
            (syntax-parse one
              [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) one)]))])))
 
-  ; a raw piece that isn't `,expr`/`,@expr` must itself be a nested grammar
-  ; shape, e.g. `(Mul ,2 ,3)` -- build its constructor call the same way the
-  ; outermost `lang-construct` call does, recursively
+  ; a raw piece that isn't `,expr`/`,@expr` must be a nested shape, e.g.
+  ; `(Mul ,2 ,3)` -- build its constructor call recursively
   (define (build-nested-construct table piece)
     (syntax-parse piece
       [(lead:id sub-piece ...)
@@ -57,12 +48,9 @@
        #`(#,ctor-id #,@args)]
       [_ (raise-syntax-error 'lang-construct "expected `,expr` or a nested `(lead ...)` shape" piece)]))
 
-  ; resolves one "value slot" piece (a scalar field, one element collected
-  ; into a `list` field, or one tuple-template element) into an argument
-  ; expression: `,expr` is used directly, and a bare `(lead ...)` shape is
-  ; resolved recursively via `build-nested-construct` -- this is what lets
-  ; `(Add (Mul ,2 ,3) ,r)` work without writing out `,(lang-construct ...)`
-  ; at every level.
+  ; resolves one value-slot piece: `,expr` used directly, or a bare
+  ; `(lead ...)` shape resolved recursively -- lets `(Add (Mul ,2 ,3) ,r)`
+  ; work without `,(lang-construct ...)` at every level
   (define (resolve-piece-expr table piece)
     (define-values (kind val) (parse-piece piece))
     (case kind
@@ -70,20 +58,13 @@
       [(splice) (raise-syntax-error 'lang-construct "expected `,expr` here, not `,@expr`" piece)]
       [(raw) (build-nested-construct table piece)]))
 
-  ; the `<lang>-meta` table (built by define-language.rkt's `rule/expand`) is
+  ; <lang>-meta table (built by define-language.rkt's rule/expand):
   ;   (nt-entry ...)
   ;   nt-entry    ::= (nt-name-id (case-entry ...) (leaf-type ...))
   ;   case-entry  ::= (lead-id ctor-id (field-shape ...))
   ;   field-shape ::= (scalar type) | (list type) | (tuple-list type ...)
-  ; `leaf-type` (one per bare top-level `,x` grammar alternative, e.g. `,n`)
-  ; isn't used here -- `lang-construct` only ever builds headed cases, since
-  ; a leaf value is already usable directly wherever the nonterminal's type
-  ; is expected -- but `r/match*` (recur-match.rkt) needs it.
-  ; `lead`/`nt-name`/the shape tags are plain labels, not bound identifiers,
-  ; so they're compared by symbol (`syntax-e`), never by hygiene -- comparing
-  ; via `~literal`/`bound-id=?` would be wrong here (and would fail across
-  ; modules besides): two `let`s typed in different places, even different
-  ; modules, should count as the same case name purely by spelling.
+  ; leaf-type isn't used here (only r/match* needs it). lead/nt-name are
+  ; compared by symbol, not hygiene -- they're plain labels, not bindings.
   (define (find-nt-entry table nt-sym)
     (for/or ([entry (in-list (syntax->list table))])
       (syntax-parse entry
@@ -96,16 +77,11 @@
          (syntax-parse ce
            [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) ce)]))]))
 
-  ; consumes `pieces` left-to-right against the ordered `field-shapes`,
-  ; producing one argument expression per field. A `scalar` field always
-  ; consumes exactly one `,expr`. A `tuple-list` field always consumes
-  ; exactly one piece, whatever its position, since it's self-delimiting:
-  ; either `,@expr` (an already-built list) or a bare `[...]` list of
-  ; `[,x ,e ...]` tuples. A `list` field consumes exactly one `,@expr` UNLESS
-  ; it's the last field, in which case it may instead greedily collect
-  ; zero-or-more remaining bare `,expr` pieces into a list -- collecting is
-  ; only unambiguous at the end, since nothing marks where it would stop
-  ; otherwise.
+  ; consumes pieces left-to-right against field-shapes, one arg expr per
+  ; field. tuple-list always takes exactly one piece (self-delimiting: `,@expr`
+  ; or a `[...]` list of tuples). list takes one `,@expr` unless it's the
+  ; last field, where it may instead collect zero-or-more bare pieces
+  ; (unambiguous only at the end).
   (define (consume-fields table field-shapes pieces case-stx)
     (cond
       [(null? field-shapes)
@@ -125,8 +101,6 @@
          [(list)
           (cond
             [(pair? rest-shapes)
-             ; not the last field: no unambiguous place to stop collecting,
-             ; so this field must be filled by a single `,@expr`
              (when (null? pieces)
                (raise-syntax-error 'lang-construct "missing `,@expr` for list field" case-stx))
              (define-values (kind val) (parse-piece (car pieces)))
@@ -136,15 +110,11 @@
                                    (car pieces)))
              (cons val (consume-fields table rest-shapes (cdr pieces) case-stx))]
             [(and (pair? pieces) (null? (cdr pieces)))
-             ; last field, exactly one piece left: either spelling is fine
              (define-values (kind val) (parse-piece (car pieces)))
              (list (if (eq? kind 'splice)
                        val
                        #`(list #,(resolve-piece-expr table (car pieces)))))]
             [else
-             ; last field, zero or several pieces left: collect them all
-             ; (mixing in a `,@expr` here is ambiguous, so it's rejected with
-             ; a clear error instead of guessed at)
              (define vals
                (for/list ([p (in-list pieces)])
                  (define-values (kind _) (parse-piece p))
@@ -186,23 +156,17 @@
 ; (lang-construct lang-id nt-id `(lead piece ...))
 ; e.g. (lang-construct Arith Expr `(Add (Mul ,2 ,3) ,r))
 ;
-; Builds an AST node of `lang-id`'s `nt-id` nonterminal using the same
-; `,`/`,@` notation `define-language` uses to declare the grammar, resolved
+; Builds an AST node using the grammar's own `,`/`,@` notation, resolved
 ; entirely at macro-expansion time against the `<lang>-meta` table
-; `define-language` emits. There is deliberately no runtime shape check --
-; Typed Racket's own check on the underlying struct constructor is the only
-; safety net needed, since the field layout is already fully known here.
-; Nesting works without repeating `lang-construct`/backticks -- `(Mul ,2 ,3)`
-; above is just more of the same quasiquote data, resolved recursively by
-; `resolve-piece-expr`/`build-nested-construct`.
+; define-language emits -- no runtime shape check, Typed Racket's own check
+; on the struct constructor is the only safety net needed. Nesting (`(Mul
+; ,2 ,3)` above) needs no repeated `lang-construct`/backticks; it's just more
+; quasiquote data, resolved recursively.
 ;
-; Scope: a `scalar` field's piece is `,expr` or a nested `(lead ...)` shape.
-; A `tuple-list` field is always one piece, either `,@expr` or a `[...]` list
-; of `[,x ,e ...]` tuples (each element resolved the same way as a scalar
-; field). A `list` field is `,@expr` unless it's the case's last field, in
-; which case it may instead be zero-or-more collected pieces (each resolved
-; the same way too) -- see `consume-fields` above for why only the last
-; field gets that leniency.
+; Scope: a scalar field's piece is `,expr` or a nested `(lead ...)` shape.
+; tuple-list is one piece, `,@expr` or a `[...]` list of tuples. list is
+; `,@expr` unless it's the case's last field, where it may instead be
+; zero-or-more collected pieces (see consume-fields for why).
 (define-syntax-parser lang-construct
   [(_ lang-id:id nt-id:id ((~literal quasiquote) (lead:id piece ...)))
    (define meta-id (format-id #'lang-id "~a-meta" #'lang-id))
@@ -239,7 +203,6 @@
 
   (check-equal? (lang-construct surface Expr `(+ ,1 ,2))
                 (surface:Expr:+ 1 2))
-  ; nested shapes resolve without repeating `lang-construct`/backticks
   (check-equal? (lang-construct surface Expr `(+ (+ ,1 ,2) ,3))
                 (surface:Expr:+ (surface:Expr:+ 1 2) 3))
 

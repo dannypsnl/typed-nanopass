@@ -1,8 +1,6 @@
 #lang typed/racket
-;; A tiny arithmetic language, and a constant-folding / algebraic-identity
-;; optimization pass over it, written with r/match*. Rebuilding a
-;; not-fully-folded node goes through lang-construct, using the same `,`
-;; notation the grammar itself uses.
+;; constant folding + algebraic-identity optimization, written with r/match*
+;; and lang-construct
 (require "../main.rkt")
 
 (define-language Arith
