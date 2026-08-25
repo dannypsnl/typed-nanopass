@@ -2,6 +2,7 @@
 (provide r/match*)
 (require syntax/parse/define racket/match
          (for-syntax racket/syntax
+                     racket/string
                      syntax/stx))
 
 (begin-for-syntax
@@ -38,6 +39,28 @@
 
   (define (field-shape-tag fs) (syntax-e (car (syntax->list fs))))
   (define (field-shape-rest fs) (cdr (syntax->list fs))) ; scalar/list: 1 type; tuple-list: N types
+
+  ; an untagged case's lead-id is always this reserved-prefixed, never
+  ; user-typed symbol (see define-language.rkt's untagged-id) -- mirrored
+  ; here rather than shared, matching find-case-entry-anywhere above
+  (define (case-entry-untagged? ce) (string-prefix? (symbol->string (case-entry-lead ce)) "#%untagged:"))
+
+  ; like find-case-entry-anywhere, but for the (at most one per nonterminal)
+  ; untagged case -- there's no lead symbol to search by, so this requires
+  ; the match to be unambiguous across the whole language instead
+  (define (find-untagged-case-entry-anywhere table pat)
+    (define matches
+      (for*/list ([nt-entry (in-list (syntax->list table))]
+                  [ce (in-value (for/or ([c (in-list (nt-entry-cases nt-entry))]) (and (case-entry-untagged? c) c)))]
+                  #:when ce)
+        (cons ce nt-entry)))
+    (cond
+      [(null? matches) (raise-syntax-error 'r/match* "no untagged case in this language" pat)]
+      [(pair? (cdr matches))
+       (raise-syntax-error 'r/match*
+                           "ambiguous: more than one nonterminal declares an untagged case"
+                           pat)]
+      [else (values (car (car matches)) (cdr (car matches)))]))
 
   ; `,x` binds directly; `,[x]` binds to (on-id x)
   (define (translate-field f on-id)
@@ -92,7 +115,11 @@
             [_ (whole-value-pat)])])]))
 
   ; returns (values match-pattern nt-entry-or-#f); nt-entry is #f for a leaf
-  ; pattern, which doesn't carry enough info to know its own nonterminal
+  ; pattern, which doesn't carry enough info to know its own nonterminal.
+  ; a 'headed result is `(cons 'headed (cons pattern lead-sym))` -- lead-sym
+  ; travels with it so callers (covered-leads, below) never need to
+  ; re-derive it by re-parsing the raw written pattern, which doesn't even
+  ; have a lead symbol to find for an untagged case (see `,fn` clause).
   (define (translate-pattern pat table on-id)
     (syntax-parse pat
       ; leaf's `?`-cast is added later in r/match*, once the nonterminal is known
@@ -105,7 +132,19 @@
          (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
        (define fields (syntax->list #'(field ...)))
        (define sub-pats (consume-field-patterns table on-id field-shapes fields pat))
-       (values (cons 'headed #`(#,ctor-id #,@sub-pats)) nt-entry)]
+       (values (cons 'headed (cons #`(#,ctor-id #,@sub-pats) (case-entry-lead ce))) nt-entry)]
+      ; `(,fn ,arg)` -- untagged pattern, e.g. matching an application with
+      ; no keyword. Reached only when the tagged clause above already
+      ; failed (first element isn't a bare id, so it can't be `lead:id`);
+      ; `untagged-fn` is itself just another field (`,fn` or `,[fn]`),
+      ; consumed the same way as any other via consume-field-patterns.
+      [(untagged-fn untagged-rest ...)
+       (define-values (ce nt-entry) (find-untagged-case-entry-anywhere table pat))
+       (define-values (ctor-id field-shapes)
+         (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+       (define fields (cons #'untagged-fn (syntax->list #'(untagged-rest ...))))
+       (define sub-pats (consume-field-patterns table on-id field-shapes fields pat))
+       (values (cons 'headed (cons #`(#,ctor-id #,@sub-pats) (case-entry-lead ce))) nt-entry)]
       [_ (raise-syntax-error 'r/match* "expected `,x` or `(lead field ...)`" pat)])))
 
 ;; --- #:auto: synthesize default clauses for every case a clause list didn't
@@ -332,13 +371,16 @@
              (define leaf-types (nt-entry-leaf-types headed-nt-entry))
              (define leaf-type (if (= 1 (length leaf-types)) (car leaf-types) #`(U #,@leaf-types)))
              #`[#,x (let ([#,x (cast #,x #,leaf-type)]) #,@bs)])
-           (let ([p (cdr k)])
+           (let ([p (car (cdr k))])
              #`[#,p #,@bs]))))
-   ; (nt-sym . lead-sym) for every explicit headed clause -- what #:auto must not re-generate
+   ; (nt-sym . lead-sym) for every explicit headed clause -- what #:auto must
+   ; not re-generate. lead-sym comes from translate-pattern's own result
+   ; (cdr of cdr), not by re-parsing the raw pattern `p` -- an untagged
+   ; pattern (`,fn ...`) has no bare lead identifier in it to find.
    (define covered-leads
-     (for/list ([p (in-list pats)] [k (in-list kinds)] [n (in-list nt-entries)]
+     (for/list ([k (in-list kinds)] [n (in-list nt-entries)]
                 #:when (eq? (car k) 'headed))
-       (cons (syntax-e (nt-entry-name n)) (syntax-parse p [(lead:id _ ...) (syntax-e #'lead)]))))
+       (cons (syntax-e (nt-entry-name n)) (cdr (cdr k)))))
    ; the nonterminal an explicit leaf clause covers -- at most one leaf
    ; clause is meaningful anyway (a bare pattern always matches first)
    (define covered-leaf-nt
@@ -419,4 +461,43 @@
   (check-equal? (count-nodes (L1:Expr:Block (list 1 2 3))) 4)
   (check-equal? (count-nodes (L1:Expr:Let (list (list 'x 1) (list 'y 2)) 3)) 4)
   (check-equal? (block-size (L1:Expr:Block (list 1 2 3))) 3)
-  (check-equal? (block-size (L1:Expr:Let (list (list 'x 1) (list 'y 2)) 3)) 2))
+  (check-equal? (block-size (L1:Expr:Let (list (list 'x 1) (list 'y 2)) 3)) 2)
+
+  ; `(,fn ,arg)` -- untagged pattern, e.g. matching an application with no
+  ; keyword. `untagged-fn`/`untagged-rest` in translate-pattern are just
+  ; ordinary fields: both `,x` (direct bind) and `,[x]` (recurse via on-id)
+  ; work here exactly like any other field.
+  (define-language L2
+    (terminals (Integer (n)) (Symbol (x)))
+    (Expr (e)
+          ,n
+          (Var ,x)
+          (Lam ,x ,e)
+          (,e ,e)))
+
+  (: count-nodes2 : L2:Expr -> Integer)
+  (define (count-nodes2 e)
+    (r/match* e
+      #:lang L2
+      #:on count-nodes2
+      [(Lam ,x ,[body]) (+ 1 body)]
+      [(,[f] ,[a]) (+ 1 f a)]
+      [(Var ,x) 1]
+      [,n 1]))
+
+  (check-equal? (count-nodes2 (L2:Expr:#%untagged:L2:Expr (L2:Expr:Var 'f) (L2:Expr:Var 'x))) 3)
+  (check-equal? (count-nodes2 (L2:Expr:Lam 'y (L2:Expr:#%untagged:L2:Expr (L2:Expr:Var 'y) 5))) 4)
+
+  ; #:auto also reaches an untagged case it wasn't given an explicit clause
+  ; for, via the same case-entry-driven default-clause machinery as any
+  ; tagged case
+  (define-language L2-Core (extends L2) (Expr (- Lam)))
+  (: strip-lam : L2:Expr -> L2-Core:Expr)
+  (define (strip-lam e)
+    (r/match* e
+      #:lang L2 #:to L2-Core #:on strip-lam #:auto
+      [(Lam ,x ,[body]) body]))
+
+  (check-equal? (strip-lam (L2:Expr:#%untagged:L2:Expr (L2:Expr:Var 'f) (L2:Expr:Var 'x)))
+                (L2:Expr:#%untagged:L2:Expr (L2:Expr:Var 'f) (L2:Expr:Var 'x)))
+  (check-equal? (strip-lam (L2:Expr:Lam 'y (L2:Expr:Var 'y))) (L2:Expr:Var 'y)))

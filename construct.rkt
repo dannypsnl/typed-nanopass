@@ -2,6 +2,7 @@
 (provide lang-construct)
 (require syntax/parse/define
          (for-syntax racket/syntax
+                     racket/string
                      syntax/stx))
 
 (begin-for-syntax
@@ -32,6 +33,42 @@
            (syntax-parse one
              [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) one)]))])))
 
+  ; an untagged case's lead-id is always this reserved-prefixed, never
+  ; user-typed symbol (see define-language.rkt's untagged-id) -- mirrored
+  ; here rather than shared, matching how this file already keeps its own
+  ; copy of find-case-entry-anywhere-style lookups instead of importing them
+  (define (case-entry-untagged? ce)
+    (syntax-parse ce
+      [(lead:id _ _) (string-prefix? (symbol->string (syntax-e #'lead)) "#%untagged:")]))
+
+  (define (find-untagged-case-entry-in nt-entry)
+    (syntax-parse nt-entry
+      [(_ (ce ...) _)
+       (for/or ([one (in-list (syntax->list #'(ce ...)))])
+         (and (case-entry-untagged? one) one))]))
+
+  ; like find-case-entry-anywhere, but for the (at most one per nonterminal)
+  ; untagged case -- there's no lead symbol to search by, so this instead
+  ; requires the match to be unambiguous across the whole language: error
+  ; out (rather than silently pick one) if more than one nonterminal has an
+  ; untagged case, since a nested untagged piece carries no nonterminal of
+  ; its own to disambiguate with (unlike lang-construct's top-level call,
+  ; which always has an explicit nt-id already)
+  (define (find-untagged-case-entry-anywhere table piece)
+    (define matches
+      (for*/list ([nt-entry (in-list (syntax->list table))]
+                  [ce (in-value (find-untagged-case-entry-in nt-entry))]
+                  #:when ce)
+        ce))
+    (cond
+      [(null? matches)
+       (raise-syntax-error 'lang-construct "no untagged case in this language" piece)]
+      [(pair? (cdr matches))
+       (raise-syntax-error 'lang-construct
+                           "ambiguous: more than one nonterminal declares an untagged case -- use lang-construct explicitly with the intended nonterminal instead of nesting"
+                           piece)]
+      [else (car matches)]))
+
   ; a raw piece that isn't `,expr`/`,@expr` must be a nested shape, e.g.
   ; `(Mul ,2 ,3)` -- build its constructor call recursively
   (define (build-nested-construct table piece)
@@ -45,6 +82,18 @@
        (define-values (ctor-id field-shapes)
          (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
        (define args (consume-fields table field-shapes (syntax->list #'(sub-piece ...)) piece))
+       #`(#,ctor-id #,@args)]
+      ; `(,fn ,arg)` -- untagged nested construction, e.g. an application
+      ; nested inside another piece. Reached only when the tagged clause
+      ; above already failed to match (first element isn't a bare id), so
+      ; `first-piece` here can be `,expr` OR itself another nested `(lead
+      ; ...)` shape -- same as any other scalar field (resolve-piece-expr
+      ; handles both uniformly once field-shapes dispatch gets there).
+      [(first-piece rest-piece ...)
+       (define ce (find-untagged-case-entry-anywhere table piece))
+       (define-values (ctor-id field-shapes)
+         (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+       (define args (consume-fields table field-shapes (syntax->list #'(first-piece rest-piece ...)) piece))
        #`(#,ctor-id #,@args)]
       [_ (raise-syntax-error 'lang-construct "expected `,expr` or a nested `(lead ...)` shape" piece)]))
 
@@ -189,6 +238,31 @@
      (syntax-parse case-entry
        [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
    (define args (consume-fields table field-shapes (syntax->list #'(piece ...)) this-syntax))
+   #`(#,ctor-id #,@args)]
+  ; `(lang-construct L Expr `(,f ,x))` -- untagged construction. Since
+  ; nt-id is explicit here (unlike a nested untagged piece), the lookup is
+  ; unambiguous even if other nonterminals also have their own untagged case.
+  [(_ lang-id:id nt-id:id ((~literal quasiquote) (first-piece:expr more-piece:expr ...)))
+   (define meta-id (format-id #'lang-id "~a-meta" #'lang-id))
+   (define table (syntax-local-value meta-id (lambda () #f)))
+   (unless table
+     (raise-syntax-error 'lang-construct
+                         (format "no such language: ~a" (syntax-e #'lang-id))
+                         #'lang-id))
+   (define nt-entry (find-nt-entry table (syntax-e #'nt-id)))
+   (unless nt-entry
+     (raise-syntax-error 'lang-construct
+                         (format "~a has no nonterminal ~a" (syntax-e #'lang-id) (syntax-e #'nt-id))
+                         #'nt-id))
+   (define case-entry (find-untagged-case-entry-in nt-entry))
+   (unless case-entry
+     (raise-syntax-error 'lang-construct
+                         (format "~a's ~a has no untagged case" (syntax-e #'lang-id) (syntax-e #'nt-id))
+                         this-syntax))
+   (define-values (ctor-id field-shapes)
+     (syntax-parse case-entry
+       [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+   (define args (consume-fields table field-shapes (syntax->list #'(first-piece more-piece ...)) this-syntax))
    #`(#,ctor-id #,@args)])
 
 (module+ test
@@ -230,4 +304,36 @@
   (define bindings : (Listof (List Symbol with-ellipsis:Expr))
     (list (list 'x 1) (list 'y 2)))
   (check-equal? (lang-construct with-ellipsis Expr `(let ,@bindings ,3))
-                (with-ellipsis:Expr:let (list (list 'x 1) (list 'y 2)) 3)))
+                (with-ellipsis:Expr:let (list (list 'x 1) (list 'y 2)) 3))
+
+  ; `(,fn ,arg)` -- untagged construction, e.g. function application with
+  ; no keyword
+  (define-language with-app
+    (terminals
+      (Integer (n))
+      (Symbol (x)))
+    (Expr (e)
+          ,n
+          (Var ,x)
+          (Lam ,x ,e)
+          (,e ,e)))
+
+  (check-equal? (lang-construct with-app Expr `(,(lang-construct with-app Expr `(Var ,'f))
+                                                 ,(lang-construct with-app Expr `(Var ,'x))))
+                (with-app:Expr:#%untagged:with-app:Expr
+                 (with-app:Expr:Var 'f) (with-app:Expr:Var 'x)))
+
+  ; fully nested, no repeated lang-construct/backtick needed at each level
+  (check-equal? (lang-construct with-app Expr `((Var ,'f) (Var ,'x)))
+                (with-app:Expr:#%untagged:with-app:Expr
+                 (with-app:Expr:Var 'f) (with-app:Expr:Var 'x)))
+  ; deeply nested: ((f x) y)
+  (check-equal? (lang-construct with-app Expr `(((Var ,'f) (Var ,'x)) (Var ,'y)))
+                (with-app:Expr:#%untagged:with-app:Expr
+                 (with-app:Expr:#%untagged:with-app:Expr
+                  (with-app:Expr:Var 'f) (with-app:Expr:Var 'x))
+                 (with-app:Expr:Var 'y)))
+  ; untagged as a field of a tagged case
+  (check-equal? (lang-construct with-app Expr `(Lam ,'y ((Var ,'y) ,5)))
+                (with-app:Expr:Lam 'y (with-app:Expr:#%untagged:with-app:Expr
+                                       (with-app:Expr:Var 'y) 5))))

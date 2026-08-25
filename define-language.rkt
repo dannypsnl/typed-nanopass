@@ -4,10 +4,24 @@
          (for-syntax ee-lib
                      fancy-app
                      racket/syntax
+                     racket/string
                      syntax/stx))
 
 (define-for-syntax (prefix-id prefix id)
   (format-id id #:source id #:props id "~a:~a" prefix id))
+
+; the internal, never-user-typed key for a nonterminal's untagged case
+; (`(,fn ,arg)` -- no leading id, e.g. function application). Deterministic
+; (not a true gensym): it's independently re-derived in two places
+; (rule-case/meta-type and rule/expand) that must agree on the identical
+; identifier for the resulting define-type/struct pair to actually link up
+; -- format-id with the same inputs always does, via free-identifier=?,
+; the same trick prefix-id already relies on. Reserved-prefixed so it can
+; never collide with a symbol a user actually wrote as a case tag;
+; construct.rkt/recur-match.rkt each independently check for this same
+; prefix (mirrored, not shared, matching this file's existing convention).
+(define-for-syntax (untagged-id nt-name)
+  (format-id nt-name #:source nt-name #:props nt-name "#%untagged:~a" nt-name))
 
 ; rule-case is a splicing syntax class (a repetition may consume >1 raw
 ; form, e.g. `,e ...`), so re-templating its bare pattern variable wraps
@@ -43,20 +57,23 @@
       #:attr as-field #`[#,(generate-temporary #'meta) : (Listof #,(lookup #'meta))]
       ; shape: field kind for lang-construct (construct.rkt), reusing as-field's lookup
       #:attr shape #`(list #,(lookup #'meta))
-      #:attr shapes #f)
+      #:attr shapes #f
+      #:attr untagged? #f)
     ; `([,x ,e] ...)`, e.g. `(let ([,x ,e] ...) ,e)`
     (pattern ((((~literal unquote) m*:id) ...+) (~datum ...))
       #:attr intro-ty #f
       #:attr as-field #`[#,(generate-temporary 'tuple*)
                          : (Listof (List #,@(stx-map lookup #'(m* ...))))]
       #:attr shape #`(tuple-list #,@(stx-map lookup #'(m* ...)))
-      #:attr shapes #f)
+      #:attr shapes #f
+      #:attr untagged? #f)
     ; `,x`
     (pattern ((~literal unquote) meta:id)
       #:attr intro-ty #f
       #:attr as-field #`[#,(generate-temporary #'meta) : #,(lookup #'meta)]
       #:attr shape #`(scalar #,(lookup #'meta))
-      #:attr shapes #f)
+      #:attr shapes #f
+      #:attr untagged? #f)
     ; `(+ ,e ,e)` -- `+` becomes a struct with fields `([e1 : T] [e2 : T])`
     ;
     ; a headed rule-case's own children must be leaf/list/tuple-list
@@ -72,8 +89,28 @@
       #:attr intro-ty #'lead
       #:attr as-field (syntax-property #'(c*.as-field ...) 'field #t)
       #:attr shape #f
-      #:attr shapes #'(c*.shape ...))
-    ; TODO: syntax without leading id, e.g. `(,fn ,arg)` instead of `(app ,fn ,arg)`
+      #:attr shapes #'(c*.shape ...)
+      #:attr untagged? #f)
+    ; `(,fn ,arg)` -- untagged headed form, e.g. function application with
+    ; no keyword. `fn` is itself the case's first field (there's no
+    ; separate tag to discard), so its own scalar field-spec is prepended
+    ; to `c*`'s. The real struct-name/lead-symbol (untagged-id) needs the
+    ; enclosing nonterminal's name, which isn't known here -- `intro-ty`
+    ; just marks "this introduces a struct" (any truthy value), same as
+    ; for a tagged case; rule/expand substitutes the real name in. At most
+    ; one untagged case per nonterminal is allowed, checked there too
+    ; (only it sees the whole case list at once).
+    (pattern (((~literal unquote) fn:id) c*:rule-case ...+)
+      #:fail-when (ormap values (attribute c*.intro-ty))
+                  "nested headed form as a field of another case isn't supported yet -- give it its own top-level case and reference it through a meta-variable instead"
+      #:attr intro-ty #'fn
+      #:attr as-field
+        (syntax-property
+          #`(#,(let ([g (generate-temporary #'fn)]) #`[#,g : #,(lookup #'fn)]) c*.as-field ...)
+          'field #t)
+      #:attr shape #f
+      #:attr shapes #`((scalar #,(lookup #'fn)) c*.shape ...)
+      #:attr untagged? #t)
     ))
 
 (begin-for-syntax
@@ -87,6 +124,9 @@
     (syntax-parse stx
       ; lookup a meta-variable associated type
       [((~literal unquote) meta:id) (lookup #'meta)]
+      ; untagged headed form -- same deterministic name rule/expand uses,
+      ; prefixed the same way a tagged case's struct type name is
+      [(((~literal unquote) fn:id) c* ...) (prefix-id name (untagged-id name))]
       ; build the struct name
       [(lead:id c* ...) (prefix-id name #'lead)]))
 
@@ -107,18 +147,32 @@
           [((case-struct ...) (case-entry ...) (leaf-type ...))
            (syntax-parse stx
              [(c*:rule-case ...)
+              (define untagged-flags (attribute c*.untagged?))
+              (when (> (length (filter values untagged-flags)) 1)
+                (raise-syntax-error 'define-language
+                  (format "~a has more than one untagged case -- at most one per nonterminal is supported"
+                          (syntax-e orig-name))
+                  stx))
+              ; an untagged case's struct-name/lead-symbol is derived from
+              ; the nonterminal alone (untagged-id) instead of intro-ty's
+              ; raw value -- intro-ty there is just a truthy "this
+              ; introduces a struct" marker, same role it plays for a
+              ; tagged case
+              (define struct-names
+                (for/list ([ity (attribute c*.intro-ty)] [u? untagged-flags])
+                  (if u? (untagged-id name) ity)))
               (list
-                (for/list ([struct-name (attribute c*.intro-ty)]
+                (for/list ([struct-name struct-names]
                            [fields (syntax->list #'(scoped-c*.as-field ...))]
                            #:when struct-name)
                   #`(struct #,(prefix-id name struct-name) #,fields #:transparent))
                 ; shapes/shape must come from scoped-c*, not c* -- they call
                 ; lookup internally, which only resolves scoped identifiers
-                (for/list ([struct-name (attribute c*.intro-ty)]
+                (for/list ([struct-name struct-names]
                            [shapes (attribute scoped-c*.shapes)]
                            #:when struct-name)
                   #`(#,struct-name #,(prefix-id name struct-name) (#,@shapes)))
-                (for/list ([struct-name (attribute c*.intro-ty)]
+                (for/list ([struct-name struct-names]
                            [shape (attribute scoped-c*.shape)]
                            #:when (not struct-name)
                            #:when shape
@@ -147,14 +201,24 @@
   (define (sx-field-shape-tag fs) (syntax-e (car (syntax->list fs))))
   (define (sx-field-shape-rest fs) (cdr (syntax->list fs))) ; scalar/list: 1 type; tuple-list: N types
 
-  ; every `lang:NT` full type name this language declares, as bare symbols --
-  ; distinguishes "this field recurses" from "this field is a terminal, copy
-  ; it as-is" (mirrors recur-match.rkt's #:auto machinery)
-  (define (sx-source-nt-syms lang-sym table)
+  ; every nonterminal this table declares, as its bare name (not
+  ; lang-prefixed) -- see sx-nonterminal-type? for why
+  (define (sx-source-nt-syms table)
     (for/list ([nt-entry (in-list (syntax->list table))])
-      (string->symbol (format "~a:~a" lang-sym (syntax-e (ext-nt-entry-name nt-entry))))))
+      (syntax-e (ext-nt-entry-name nt-entry))))
 
-  (define (sx-nonterminal-type? type-id nt-syms) (and (memq (syntax-e type-id) nt-syms) #t))
+  ; a type-id recurses if its symbol names one of this table's own
+  ; nonterminals -- compared by the BARE name (the part after the last
+  ; `:`), not the full `lang:NT` symbol: `extends` inherits a case's
+  ; field-shapes verbatim, so an inherited field's recorded type is
+  ; prefixed with whichever ancestor language originally declared that
+  ; case (e.g. `Surface:Expr` on a case Core inherited unchanged), not
+  ; necessarily this table's own language -- matching on the bare
+  ; nonterminal name is what makes recursion still fire on those
+  ; inherited fields instead of silently treating them as terminals.
+  (define (sx-nonterminal-type? type-id nt-syms)
+    (define parts (string-split (symbol->string (syntax-e type-id)) ":"))
+    (and (pair? parts) (memq (string->symbol (car (reverse parts))) nt-syms) #t))
 
   ; a field's contribution to the printed form, meant to be spliced together
   ; with `append`: scalar/tuple-list contribute a single-element list (their
@@ -179,7 +243,14 @@
     #`(list (for/list : (Listof Any) ([one : (List #,@tys) (in-list #,v)])
               (match one [(list #,@comps) (list #,@converted)]))))
 
-  ; one `[(Ctor f ...) (append (list 'lead) part ...)]` match clause
+  ; an untagged case's lead-id is never user-written -- it's always
+  ; untagged-id's reserved-prefixed output -- so it's printed with no tag
+  ; at all, `(fn-sexp arg-sexp)`, matching the original untagged syntax
+  ; instead of leaking the internal key.
+  (define (sx-untagged-lead? lead) (string-prefix? (symbol->string (syntax-e lead)) "#%untagged:"))
+
+  ; one `[(Ctor f ...) (append (list 'lead) part ...)]` match clause (or,
+  ; for an untagged case, `(append part ...)` with no lead at all)
   (define (sx-build-case-clause ce nt-syms self-id)
     (define-values (lead ctor field-shapes) (sx-case-entry-parts ce))
     (define field-vars (for/list ([_ (in-list field-shapes)]) (generate-temporary 'f)))
@@ -190,9 +261,11 @@
           [(scalar) (sx-scalar-part v (car rest) nt-syms self-id)]
           [(list) (sx-list-part v (car rest) nt-syms self-id)]
           [(tuple-list) (sx-tuple-list-part v rest nt-syms self-id)])))
-    #`[(#,ctor #,@field-vars) (append (list (quote #,lead)) #,@parts)])
+    (if (sx-untagged-lead? lead)
+        #`[(#,ctor #,@field-vars) (append #,@parts)]
+        #`[(#,ctor #,@field-vars) (append (list (quote #,lead)) #,@parts)]))
 
-  ; (build-lang->sexp-def name-id table lang-sym) -> syntax
+  ; (build-lang->sexp-def name-id table) -> syntax
   ;
   ; `name-id : Any -> Any`, matching every case of every nonterminal `table`
   ; (a language's `<lang>-meta` table) declares, and reconstructing the plain
@@ -202,8 +275,8 @@
   ; what gets printed; there's no per-case custom pretty name/abbreviation
   ; (write that by hand, e.g. via a plain `r/match*` pass, when one's
   ; wanted).
-  (define (build-lang->sexp-def name-id table lang-sym)
-    (define nt-syms (sx-source-nt-syms lang-sym table))
+  (define (build-lang->sexp-def name-id table)
+    (define nt-syms (sx-source-nt-syms table))
     (define clauses
       (for*/list ([nt-entry (in-list (syntax->list table))]
                   [ce (in-list (ext-nt-entry-cases nt-entry))])
@@ -265,7 +338,7 @@
          (define-syntax #,extends-id (quote-syntax #f))
          #,@terminal-checks
          #,@rule-defs
-         #,(build-lang->sexp-def sexp-id meta-table (syntax-e #'lang))))]
+         #,(build-lang->sexp-def sexp-id meta-table)))]
   ; `(define-language Child (extends Parent) (NT (- lead ...)) ...)`
   ;
   ; Every nonterminal Child doesn't mention is inherited from Parent
@@ -330,7 +403,7 @@
        (define-syntax #,meta-id (quote-syntax (#,@new-entries)))
        (define-syntax #,extends-id (quote-syntax parent))
        #,@type-defs
-       #,(build-lang->sexp-def sexp-id new-table (syntax-e #'lang)))])
+       #,(build-lang->sexp-def sexp-id new-table))])
 
 (module+ test
   (require typed/rackunit syntax/macro-testing)
@@ -380,4 +453,46 @@
       (convert-compile-time-error
         (define-language Bad-Nested
           (terminals (Integer (n)))
-          (Expr (e) ,n (Add ,e ,e) (Neg (Add ,e ,e))))))))
+          (Expr (e) ,n (Add ,e ,e) (Neg (Add ,e ,e)))))))
+
+  ; `(,fn ,arg)` -- untagged case, e.g. function application with no
+  ; keyword. `<lang>->sexp` prints it with no tag at all, matching the
+  ; original untagged syntax.
+  (define-language with-app
+    (terminals
+      (Integer (n))
+      (Symbol (x)))
+    (Expr (e)
+          ,n
+          (Var ,x)
+          (Lam ,x ,e)
+          (,e ,e)))
+
+  (define app : with-app:Expr
+    (with-app:Expr:#%untagged:with-app:Expr
+     (with-app:Expr:Var 'f) (with-app:Expr:Var 'x)))
+  (check-equal? (with-app->sexp app) '((Var f) (Var x)))
+  ; nested untagged application: ((f x) y)
+  (define nested-app : with-app:Expr
+    (with-app:Expr:#%untagged:with-app:Expr
+     app (with-app:Expr:Var 'y)))
+  (check-equal? (with-app->sexp nested-app) '(((Var f) (Var x)) (Var y)))
+
+  ; extends inherits an untagged case's cases verbatim, including recursion
+  ; into an inherited field whose recorded type is prefixed with the
+  ; PARENT language's name (with-app:Expr), not the child's own
+  ; (with-app-core:Expr) -- <lang>->sexp must still recurse there, not
+  ; silently treat it as a terminal
+  (define-language with-app-core (extends with-app) (Expr (- Lam)))
+  (define core-app : with-app-core:Expr
+    (with-app:Expr:#%untagged:with-app:Expr
+     (with-app:Expr:Var 'f) (with-app:Expr:Var 'x)))
+  (check-equal? (with-app-core->sexp core-app) '((Var f) (Var x)))
+
+  ; at most one untagged case per nonterminal
+  (check-exn #rx"more than one untagged case"
+    (lambda ()
+      (convert-compile-time-error
+        (define-language Bad-Untagged
+          (terminals (Integer (n)) (Symbol (x)))
+          (Expr (e) ,n (Var ,x) (,e ,e) (,e ,e ,e)))))))
