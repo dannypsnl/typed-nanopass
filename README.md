@@ -11,6 +11,8 @@ nanopass 的重點是根據語言定義自動生成走訪結構，typed 版的�
 2. 在編譯到 asm-like 的模型的語言時，遞迴之後要展開兩次是非常合理的。nanopass 因為只允許目前範圍內的 splicing 而變得很麻煩。我希望可以直接寫 `,@pattern`
 3. 語言總是只能從 entry 進入(無論是自動生成的 parse 或是 pass 預設的進入點)，但這個限制似乎沒有什麼意義
 
+再者，基於 typed/racket 編寫 macro，利用 types 驗證程式構造是否正確，會比排查一些複雜 pass 過程中莫名混進來的問題簡單很多
+
 並非核心要求的則有
 
 - 允許為 parametric polymorphism 生成語言
