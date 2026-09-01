@@ -288,6 +288,156 @@
             #,@clauses
             [_ x])))))
 
+; parser -- the inverse of the unparser block above
+(begin-for-syntax
+  ; `<lang>:<NT>`, the type <lang>'s NT rule expands to. Context comes from
+  ; `lang` for the same reason the extends clause spells it out below: an
+  ; inherited nt-name carries the PARENT language's expansion history.
+  (define (px-nt-type-id lang-id nt-name)
+    (format-id lang-id "~a:~a" (syntax-e lang-id) (syntax-e nt-name)))
+  ; `sexp-><lang>:<NT>` -- one parser per nonterminal, not one per language:
+  ; a bare s-expression doesn't say which nonterminal it belongs to, and a
+  ; language has no privileged entry nonterminal to assume (see README).
+  (define (px-parser-id lang-id nt-sym)
+    (format-id lang-id "sexp->~a:~a" (syntax-e lang-id) nt-sym))
+  ; the nonterminal a field type names, by its bare name -- same
+  ; last-`:`-segment rule sx-nonterminal-type? explains
+  (define (px-bare-nt-sym type-id)
+    (string->symbol (car (reverse (string-split (symbol->string (syntax-e type-id)) ":")))))
+  (define (px-recur-id lang-id ty) (px-parser-id lang-id (px-bare-nt-sym ty)))
+
+  (define (px-list-field? fs) (eq? (sx-field-shape-tag fs) 'list))
+
+  ; one value slot: recur through this language's own parser when the field
+  ; is a nonterminal, otherwise check the terminal type at runtime.
+  ; `pred-for` hands back an identifier bound to that type's `make-predicate`
+  ; -- so a terminal type has to be one Typed Racket can build a predicate
+  ; for (any flat type is), the one constraint this generated parser adds
+  ; over the rest of define-language.
+  (define (px-scalar-conv v ty nt-syms lang-id who pred-for)
+    (if (sx-nonterminal-type? ty nt-syms)
+        #`(#,(px-recur-id lang-id ty) #,v)
+        #`(if (#,(pred-for ty) #,v)
+              #,v
+              (error '#,who "expected ~a, got: ~e" '#,(syntax->datum ty) #,v))))
+
+  ; `,e ...` -- the match pattern already spliced these out as siblings, so
+  ; the binding is the whole list
+  (define (px-list-conv v ty nt-syms lang-id who pred-for)
+    (define one (generate-temporary 'one))
+    #`(for/list : (Listof #,ty) ([#,one : Any (in-list #,v)])
+        #,(px-scalar-conv one ty nt-syms lang-id who pred-for)))
+
+  ; `[,x ,e] ...` -- one sexp element, a list of arity-N tuples. `assert
+  ; list?` is what tells Typed Racket the `Any` this matched really is a
+  ; list; the inner `match` does the same job for each tuple's own shape.
+  (define (px-tuple-list-conv v tys nt-syms lang-id who pred-for)
+    (define one (generate-temporary 'one))
+    (define comps (for/list ([_ (in-list tys)]) (generate-temporary 'c)))
+    (define converted
+      (for/list ([c (in-list comps)] [ty (in-list tys)])
+        (px-scalar-conv c ty nt-syms lang-id who pred-for)))
+    #`(for/list : (Listof (List #,@tys)) ([#,one : Any (in-list (assert #,v list?))])
+        (match #,one
+          [(list #,@comps) (list #,@converted)]
+          [_ (error '#,who "expected a ~a-element tuple, got: ~e" #,(length tys) #,one)])))
+
+  ; one `[(list 'lead pat ...) (Ctor arg ...)]` match clause (for an untagged
+  ; case, `(list pat ...)` with no lead -- mirroring how the unparser prints
+  ; it with no tag). A `,e ...` field contributes `pat ...` to the pattern,
+  ; every other field contributes exactly one pattern, which is what makes
+  ; the positions line up with what <lang>->sexp emitted.
+  (define (px-build-case-clause ce nt-syms lang-id who pred-for)
+    (define-values (lead ctor field-shapes) (sx-case-entry-parts ce))
+    (define untagged? (sx-untagged-lead? lead))
+    (cond
+      ; two `...` fields in one case can't be split back apart from the
+      ; printed form (and `match` won't take two ellipses in one list
+      ; pattern either) -- a tagged case still gets a clause, so the failure
+      ; names the case instead of just the nonterminal. An untagged one has
+      ; no lead to recognize it by, so it gets no clause at all and falls
+      ; through to the nonterminal-level error below.
+      [(> (length (filter px-list-field? field-shapes)) 1)
+       (and (not untagged?)
+            #`[(list-rest (quote #,lead) _)
+               (error '#,who
+                      "case ~a has more than one `...` field -- sexp-> can't parse it back unambiguously"
+                      '#,lead)])]
+      [else
+       (define field-vars (for/list ([_ (in-list field-shapes)]) (generate-temporary 'f)))
+       (define pats
+         (apply append
+           (for/list ([fs (in-list field-shapes)] [v (in-list field-vars)])
+             ; `...` reaches the pattern as spliced data, never as template
+             ; text -- a `#'` template would read it as an ellipsis instead
+             (if (px-list-field? fs) (list v (datum->syntax lang-id '...)) (list v)))))
+       (define args
+         (for/list ([fs (in-list field-shapes)] [v (in-list field-vars)])
+           (define rest (sx-field-shape-rest fs))
+           (case (sx-field-shape-tag fs)
+             [(scalar) (px-scalar-conv v (car rest) nt-syms lang-id who pred-for)]
+             [(list) (px-list-conv v (car rest) nt-syms lang-id who pred-for)]
+             [(tuple-list) (px-tuple-list-conv v rest nt-syms lang-id who pred-for)])))
+       (if untagged?
+           #`[(list #,@pats) (#,ctor #,@args)]
+           #`[(list (quote #,lead) #,@pats) (#,ctor #,@args)])]))
+
+  ; (build-sexp->lang-defs lang-id table) -> syntax
+  ;
+  ; `sexp-><lang>:<NT> : Any -> <lang>:<NT>` for every nonterminal `table`
+  ; declares, mutually recursive, undoing what `<lang>->sexp` printed. Cases
+  ; are tried in declaration order, the untagged case only after every tagged
+  ; one (its pattern has no lead to tell it apart by), and bare terminal
+  ; alternatives last, so a structured form is never eaten by a leaf whose
+  ; type happens to admit it. Anything left over is a runtime error naming
+  ; the nonterminal it failed against -- parsing is the one place a
+  ; well-typed program still meets input the grammar can't vouch for.
+  (define (build-sexp->lang-defs lang-id table)
+    (define nt-syms (sx-source-nt-syms table))
+    ; one `make-predicate` per distinct terminal type, hoisted out of the
+    ; parsers so it isn't rebuilt per call
+    (define preds (make-hash))
+    (define pred-defs '())
+    (define (pred-for ty)
+      (define key (syntax->datum ty))
+      (or (hash-ref preds key #f)
+          (let ([id (generate-temporary 'terminal?)])
+            (hash-set! preds key id)
+            (set! pred-defs (cons #`(define #,id (make-predicate #,ty)) pred-defs))
+            id)))
+    (define parser-defs
+      (for/list ([nt-entry (in-list (syntax->list table))])
+        (define nt-name (ext-nt-entry-name nt-entry))
+        (define fn-id (px-parser-id lang-id (syntax-e nt-name)))
+        (define nt-type (px-nt-type-id lang-id nt-name))
+        (define x (generate-temporary 'sexp))
+        ; the untagged case's pattern has no lead to tell it apart by, so it
+        ; goes after every tagged one -- otherwise `(Var x)` would parse as
+        ; an application of `Var` in a language that has both
+        (define (untagged-case? ce)
+          (define-values (lead _ctor _fs) (sx-case-entry-parts ce))
+          (sx-untagged-lead? lead))
+        (define all-cases (ext-nt-entry-cases nt-entry))
+        (define ordered-cases
+          (append (filter (lambda (ce) (not (untagged-case? ce))) all-cases)
+                  (filter untagged-case? all-cases)))
+        (define case-clauses
+          (filter values
+                  (for/list ([ce (in-list ordered-cases)])
+                    (px-build-case-clause ce nt-syms lang-id (syntax-e fn-id) pred-for))))
+        (define leaf-clauses
+          (for/list ([lt (in-list (ext-nt-entry-leaf-types nt-entry))])
+            (define v (generate-temporary 'leaf))
+            #`[(? #,(pred-for lt) #,v) #,v]))
+        #`(begin
+            (: #,fn-id : Any -> #,nt-type)
+            (define (#,fn-id #,x)
+              (match #,x
+                #,@case-clauses
+                #,@leaf-clauses
+                [_ (error '#,(syntax-e fn-id) "cannot parse as ~a: ~e" '#,(syntax-e nt-type) #,x)])))))
+    #`(begin #,@(reverse pred-defs) #,@parser-defs)))
+
 (define-syntax-parser define-language
   [(_ lang:id
       (terminals t*:ty-meta ...)
@@ -338,7 +488,8 @@
          (define-syntax #,extends-id (quote-syntax #f))
          #,@terminal-checks
          #,@rule-defs
-         #,(build-lang->sexp-def sexp-id meta-table)))]
+         #,(build-lang->sexp-def sexp-id meta-table)
+         #,(build-sexp->lang-defs #'lang meta-table)))]
   ; `(define-language Child (extends Parent) (NT (- lead ...)) ...)`
   ;
   ; Every nonterminal Child doesn't mention is inherited from Parent
@@ -403,7 +554,8 @@
        (define-syntax #,meta-id (quote-syntax (#,@new-entries)))
        (define-syntax #,extends-id (quote-syntax parent))
        #,@type-defs
-       #,(build-lang->sexp-def sexp-id new-table))])
+       #,(build-lang->sexp-def sexp-id new-table)
+       #,(build-sexp->lang-defs #'lang new-table))])
 
 (module+ test
   (require typed/rackunit syntax/macro-testing)
@@ -421,6 +573,19 @@
   ; pass needed just to print a term back as an s-expression
   (check-equal? (surface->sexp a) '(+ 1 2))
   (check-equal? (surface->sexp 5) 5)
+  ; ... and a parser per nonterminal, `sexp-><lang>:<NT>`, the inverse of
+  ; `<lang>->sexp` -- per nonterminal, not per language, since a bare
+  ; s-expression doesn't say which one it belongs to
+  (check-equal? (sexp->surface:Expr '(+ 1 2)) a)
+  (check-equal? (sexp->surface:Expr 5) 5)
+  (check-equal? (sexp->surface:Expr (surface->sexp a)) a)
+  ; parsing is where a well-typed program meets input the grammar can't
+  ; vouch for, so every field is checked: a nonterminal one by recurring,
+  ; a terminal one against its own type (see the `let` binder below)
+  (check-exn #rx"cannot parse as surface:Expr: 'x"
+    (lambda () (sexp->surface:Expr '(+ x 2))))
+  (check-exn #rx"cannot parse as surface:Expr"
+    (lambda () (sexp->surface:Expr '(- 1 2))))
 
   (define-language with-ellipsis
     (terminals
@@ -441,10 +606,28 @@
 
   (check-equal? (with-ellipsis->sexp b) '(let ((x 1) (y 2)) 3))
   (check-equal? (with-ellipsis->sexp c) '(block 1 2 3))
+  ; ellipsis fields round-trip: `,e ...` splices into siblings of the lead,
+  ; `[,x ,e] ...` stays one bracketed element
+  (check-equal? (sexp->with-ellipsis:Expr '(let ((x 1) (y 2)) 3)) b)
+  (check-equal? (sexp->with-ellipsis:Expr '(block 1 2 3)) c)
+  (check-equal? (sexp->with-ellipsis:Expr (with-ellipsis->sexp b)) b)
+  (check-equal? (sexp->with-ellipsis:Expr '(block))
+                (with-ellipsis:Expr:block (list)))
+  (check-equal? (sexp->with-ellipsis:Expr '(block 1 (block 2) 3))
+                (with-ellipsis:Expr:block (list 1 (with-ellipsis:Expr:block (list 2)) 3)))
+  (check-exn #rx"expected a 2-element tuple"
+    (lambda () (sexp->with-ellipsis:Expr '(let ((x)) 3))))
+  (check-exn #rx"expected Symbol, got: 1"
+    (lambda () (sexp->with-ellipsis:Expr '(let ((1 1)) 3))))
 
   (define-language core (extends with-ellipsis) (Expr (- let)))
   (define d : core:Expr (with-ellipsis:Expr:block (list 1 2 3)))
   (check-equal? (core->sexp d) '(block 1 2 3))
+  ; an extended language's parser accepts exactly the cases it kept -- a
+  ; removed one is no longer parseable, the whole point of removing it
+  (check-equal? (sexp->core:Expr '(block 1 2 3)) d)
+  (check-exn #rx"cannot parse as core:Expr"
+    (lambda () (sexp->core:Expr '(let ((x 1)) 2))))
 
   ; a headed rule-case's own field can't be another headed form -- must fail
   ; at the offending grammar, not crash inside syntax-parse's internals
@@ -477,6 +660,11 @@
     (with-app:Expr:#%untagged:with-app:Expr
      app (with-app:Expr:Var 'y)))
   (check-equal? (with-app->sexp nested-app) '(((Var f) (Var x)) (Var y)))
+  ; the parser tries the untagged case only after every tagged one, so
+  ; `(Var f)` is still a Var, not an application of `Var`
+  (check-equal? (sexp->with-app:Expr '((Var f) (Var x))) app)
+  (check-equal? (sexp->with-app:Expr '(((Var f) (Var x)) (Var y))) nested-app)
+  (check-equal? (sexp->with-app:Expr '(Var f)) (with-app:Expr:Var 'f))
 
   ; extends inherits an untagged case's cases verbatim, including recursion
   ; into an inherited field whose recorded type is prefixed with the
@@ -488,6 +676,16 @@
     (with-app:Expr:#%untagged:with-app:Expr
      (with-app:Expr:Var 'f) (with-app:Expr:Var 'x)))
   (check-equal? (with-app-core->sexp core-app) '((Var f) (Var x)))
+
+  ; a case with two `...` fields can't be split back apart from the printed
+  ; form -- it still prints, and says so where it failed when parsed
+  (define-language two-ellipsis
+    (terminals (Integer (n)))
+    (Expr (e) ,n (both ,e ... ,e ...)))
+  (check-equal? (two-ellipsis->sexp (two-ellipsis:Expr:both (list 1) (list 2)))
+                '(both 1 2))
+  (check-exn #rx"more than one `[.][.][.]` field"
+    (lambda () (sexp->two-ellipsis:Expr '(both 1 2))))
 
   ; at most one untagged case per nonterminal
   (check-exn #rx"more than one untagged case"

@@ -9,6 +9,12 @@
 - Untagged headed cases, e.g. `(,fn ,arg)`.
 - `extends`: inherit, add, remove cases; unchanged cases share the parent struct.
 - Generates a `Lang->sexp` unparser.
+- Generates a `sexp->Lang:Nonterminal` parser for each nonterminal, the
+  unparser's inverse -- per nonterminal, since a bare s-expression doesn't say
+  which one it belongs to, and no nonterminal is a privileged entry point.
+  Terminal fields are checked at runtime (so a terminal's type has to be one
+  `make-predicate` accepts); a case with two `...` fields prints but can't be
+  parsed back, and says so.
 - Unused terminals are still typechecked; a nested headed form as a field is a
   clear error.
 
