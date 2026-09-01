@@ -7,6 +7,13 @@
 - `,x` marks meta variables explicitly, so heads are never mistaken for fields.
 - Ellipsis fields: `,e ...` and `[,x ,e] ...`.
 - Untagged headed cases, e.g. `(,fn ,arg)`.
+- Pretty forms: `case => pretty-form`, e.g. `(bind ,x ,ty) => (,x : ,ty)`, or
+  `(let ([,x ,e] ...) ,e) => (let* ([,x = ,e] ...) in ,e)`. That's the form the
+  language prints as and parses back from; only the literals move, so the
+  pretty form has to use the case's own meta-variables in the case's order
+  (checked at the grammar). `lang-construct` and `r/match*` keep using the
+  grammar's `(lead ,field ...)` notation -- that's the shape the structs are
+  named after.
 - `extends`: inherit, add, remove cases; unchanged cases share the parent struct.
 - Generates a `Lang->sexp` unparser.
 - Generates a `sexp->Lang:Nonterminal` parser for each nonterminal, the

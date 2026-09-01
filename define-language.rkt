@@ -34,26 +34,25 @@
     ; TODO: how to check this is a valid type in typed/racket?
     (pattern (type (meta:id ...+))))
 
+  ; the body is cases, each optionally followed by `=> pretty-form` -- kept
+  ; raw here (not `case*:rule-case ...+`) because a case and its pretty form
+  ; have to stay paired up, and rule-case is a splicing class, so how many
+  ; body forms one case covers is only known once it's parsed
+  ; (split-rule-body does exactly that)
   (define-syntax-class rule
-    (pattern (name:id (meta:id ...+)
-                      #| TODO:
-                      Currently, we have only simple rule-case
-                      there should have a syntax
+    (pattern (name:id (meta:id ...+) body ...+))))
 
-                        rule-case => rule-pretty-form
-
-                      for example,
-
-                        (bind ,x ,ty) => (,x : ,ty)
-
-                      The bind structure will be printed as the right-hand side pretty form
-                      |#
-                      case*:rule-case ...+)))
+(begin-for-syntax
   (define-splicing-syntax-class rule-case
     ; must come before the plain leaf pattern, so `,x ...` is one list-field
     ; case instead of a leaf case followed by a dangling `...`
     (pattern (~seq ((~literal unquote) meta:id) (~datum ...))
       #:attr intro-ty #f
+      ; metas: this field's meta-variables, grouped per field -- one group
+      ; each, N for a tuple-list. A `=>` pretty form is checked against them
+      ; (see pretty-plan), which is what keeps it a re-layout of the same
+      ; fields rather than a second, silently diverging spelling of the case.
+      #:attr metas #'((meta))
       #:attr as-field #`[#,(generate-temporary #'meta) : (Listof #,(lookup #'meta))]
       ; shape: field kind for lang-construct (construct.rkt), reusing as-field's lookup
       #:attr shape #`(list #,(lookup #'meta))
@@ -62,6 +61,7 @@
     ; `([,x ,e] ...)`, e.g. `(let ([,x ,e] ...) ,e)`
     (pattern ((((~literal unquote) m*:id) ...+) (~datum ...))
       #:attr intro-ty #f
+      #:attr metas #'((m* ...))
       #:attr as-field #`[#,(generate-temporary 'tuple*)
                          : (Listof (List #,@(stx-map lookup #'(m* ...))))]
       #:attr shape #`(tuple-list #,@(stx-map lookup #'(m* ...)))
@@ -70,6 +70,7 @@
     ; `,x`
     (pattern ((~literal unquote) meta:id)
       #:attr intro-ty #f
+      #:attr metas #'((meta))
       #:attr as-field #`[#,(generate-temporary #'meta) : #,(lookup #'meta)]
       #:attr shape #`(scalar #,(lookup #'meta))
       #:attr shapes #f
@@ -87,6 +88,7 @@
       #:fail-when (ormap values (attribute c*.intro-ty))
                   "nested headed form as a field of another case isn't supported yet -- give it its own top-level case and reference it through a meta-variable instead"
       #:attr intro-ty #'lead
+      #:attr metas #`(#,@(apply append (map syntax->list (syntax->list #'(c*.metas ...)))))
       #:attr as-field (syntax-property #'(c*.as-field ...) 'field #t)
       #:attr shape #f
       #:attr shapes #'(c*.shape ...)
@@ -104,6 +106,8 @@
       #:fail-when (ormap values (attribute c*.intro-ty))
                   "nested headed form as a field of another case isn't supported yet -- give it its own top-level case and reference it through a meta-variable instead"
       #:attr intro-ty #'fn
+      ; `fn` is the case's own first field, so its group leads the rest
+      #:attr metas #`((fn) #,@(apply append (map syntax->list (syntax->list #'(c*.metas ...)))))
       #:attr as-field
         (syntax-property
           #`(#,(let ([g (generate-temporary #'fn)]) #`[#,g : #,(lookup #'fn)]) c*.as-field ...)
@@ -112,6 +116,32 @@
       #:attr shapes #`((scalar #,(lookup #'fn)) c*.shape ...)
       #:attr untagged? #t)
     ))
+
+; `case => pretty-form`, e.g.
+;
+;   (Bind (b) (bind ,x ,ty) => (,x : ,ty))
+;
+; splits one rule body into (cases . pretty-forms), the two lists aligned by
+; index (a case with no `=>` gets #f). Where one case ends is rule-case's own
+; decision -- a repetition covers two body forms (`,e` and `...`) -- so this
+; parses one off the front and takes back however much it consumed, rather
+; than trying to re-derive that.
+(define-for-syntax (split-rule-body body)
+  (let loop ([fs body] [cases '()] [pretties '()])
+    (cond
+      [(null? fs) (cons (reverse cases) (reverse pretties))]
+      [else
+       ; no fallback clause: a malformed case must surface rule-case's own
+       ; error (e.g. the nested-headed-form one), not a generic one from here
+       (define rest-forms
+         (syntax-parse #`(#,@fs) [(c:rule-case rest ...) (syntax->list #'(rest ...))]))
+       (define raw
+         (for/list ([f (in-list fs)] [_ (in-range (- (length fs) (length rest-forms)))]) f))
+       (define-values (pretty tail)
+         (syntax-parse #`(#,@rest-forms)
+           [((~datum =>) p rest ...) (values #'p (syntax->list #'(rest ...)))]
+           [_ (values #f rest-forms)]))
+       (loop tail (cons raw cases) (cons pretty pretties))])))
 
 (begin-for-syntax
   (define (meta-variable/bind stx)
@@ -135,11 +165,11 @@
   ; returns (cons definitions nt-entry): definitions are struct/type forms
   ; for this rule; nt-entry is this rule's slice of the <lang>-meta table
   ; lang-construct/r/match* read back --
-  ; (orig-name ((lead ctor-id (field-shape ...)) ...) (leaf-type ...))
+  ; (orig-name ((lead ctor-id (field-shape ...) pretty-or-#f) ...) (leaf-type ...))
   ; leaf-type is the type of each top-level bare `,x` alternative (e.g. `,n`
   ; in `(Expr (e) ,n (Add ,e ,e))`) -- no struct/case-entry, but r/match*
   ; needs it to narrow a leaf clause's binding, which a bare match variable can't.
-  (define (rule/expand scoped-stx stx name orig-name)
+  (define (rule/expand scoped-stx stx name orig-name pretties)
     (syntax-parse scoped-stx
       [(scoped-c*:rule-case ...)
        (with-syntax
@@ -161,6 +191,13 @@
               (define struct-names
                 (for/list ([ity (attribute c*.intro-ty)] [u? untagged-flags])
                   (if u? (untagged-id name) ity)))
+              ; a bare `,x` alternative is one of the nonterminal's types, not
+              ; a form -- there's nothing for a pretty form to lay out
+              (for ([struct-name struct-names] [pretty (in-list pretties)])
+                (when (and pretty (not struct-name))
+                  (raise-syntax-error 'define-language
+                    "`=>` lays out a headed case -- a bare meta-variable alternative has no form to give"
+                    pretty)))
               (list
                 (for/list ([struct-name struct-names]
                            [fields (syntax->list #'(scoped-c*.as-field ...))]
@@ -168,10 +205,19 @@
                   #`(struct #,(prefix-id name struct-name) #,fields #:transparent))
                 ; shapes/shape must come from scoped-c*, not c* -- they call
                 ; lookup internally, which only resolves scoped identifiers
+                ; checked here, at the grammar, where the meta-variable names
+                ; are still around to check against (see pretty-plan)
                 (for/list ([struct-name struct-names]
                            [shapes (attribute scoped-c*.shapes)]
+                           [metas (attribute c*.metas)]
+                           [u? untagged-flags]
+                           [pretty (in-list pretties)]
                            #:when struct-name)
-                  #`(#,struct-name #,(prefix-id name struct-name) (#,@shapes)))
+                  (when pretty
+                    (pretty-plan struct-name u? (syntax->list shapes)
+                                 (map syntax->list (syntax->list metas)) pretty))
+                  #`(#,struct-name #,(prefix-id name struct-name) (#,@shapes)
+                     #,(or pretty #'#f)))
                 (for/list ([struct-name struct-names]
                            [shape (attribute scoped-c*.shape)]
                            #:when (not struct-name)
@@ -187,17 +233,131 @@
   (define (ext-nt-entry-name entry) (syntax-parse entry [(name:id _ _) #'name]))
   (define (ext-nt-entry-cases entry) (syntax-parse entry [(_ (ce ...) _) (syntax->list #'(ce ...))]))
   (define (ext-nt-entry-leaf-types entry) (syntax-parse entry [(_ _ (lt ...)) (syntax->list #'(lt ...))]))
-  (define (ext-case-entry-lead ce) (syntax-parse ce [(lead:id _ _) (syntax-e #'lead)]))
-  (define (ext-case-entry-ctor ce) (syntax-parse ce [(_ ctor:id _) #'ctor]))
+  (define (ext-case-entry-lead ce) (syntax-parse ce [(lead:id _ _ . _) (syntax-e #'lead)]))
+  (define (ext-case-entry-ctor ce) (syntax-parse ce [(_ ctor:id _ . _) #'ctor]))
 
   (define-syntax-class extend-delta
     (pattern (nt-name:id ((~datum -) rm:id ...))
       #:attr removed (syntax->list #'(rm ...)))))
 
+; pretty forms -- `case => pretty-form`
+;
+; The pretty form is what `<lang>->sexp` prints and, mirrored, what
+; `sexp-><lang>:<NT>` parses. `lang-construct` and `r/match*` keep using the
+; grammar's own `(lead ,field ...)` notation: that's the shape the structs are
+; named after, and a program that builds or matches nodes should read like the
+; grammar, not like the surface syntax being printed.
+;
+; Only the literals move. The pretty form has to mention the case's own
+; meta-variables, in the case's own order (checked against rule-case's `metas`
+; when the language is defined), so its slots always line up with the fields.
+(begin-for-syntax
+  ; one `=>` template, read left to right with a form of lookahead for `...`
+  ; -- the same shapes a rule-case is written in
+  ;   item ::= (slot m) | (slot* m) | (tuple (inner ...)) | (lit datum)
+  ;   inner ::= (comp m) | (lit datum)
+  (define (pretty-template-items pretty)
+    (define (tuple-items sub*)
+      (for/list ([one (in-list sub*)])
+        (syntax-parse one
+          [((~literal unquote) m:id) (list 'comp #'m)]
+          [_ (list 'lit one)])))
+    (let loop ([fs (syntax->list pretty)] [acc '()])
+      (cond
+        [(null? fs) (reverse acc)]
+        [else
+         ; `,m ...` is two forms, the way the grammar writes a list field;
+         ; a tuple-list is one, `([,x ,e] ...)`, again as the grammar writes it
+         (define dots? (and (pair? (cdr fs)) (eq? (syntax-e (cadr fs)) '...)))
+         (define-values (item wide?)
+           (syntax-parse (car fs)
+             [((~literal unquote) m:id)
+              (if dots? (values (list 'slot* #'m) #t) (values (list 'slot #'m) #f))]
+             [(tuple (~datum ...))
+              (values (list 'tuple (tuple-items (or (syntax->list #'tuple) '()))) #f)]
+             [_ (values (list 'lit (car fs)) #f)]))
+         (loop (if wide? (cddr fs) (cdr fs)) (cons item acc))])))
+
+  ; (pretty-plan lead untagged? field-shapes metas pretty) -> plan
+  ;   plan  ::= (piece ...)
+  ;   piece ::= (lit datum) | (field field-shape inner)
+  ;   inner ::= #f | (item ...)   ; tuple-list only, from a `[,x = ,e] ...`
+  ;
+  ; The plan is the printed form, piece by piece -- the one description both
+  ; the printer and the parser are generated from, which is what keeps them
+  ; inverses of each other whether or not a case has a pretty form. Without
+  ; one, the plan is the grammar's own shape: the lead (unless untagged),
+  ; then each field in order.
+  ;
+  ; `metas` is rule-case's per-field meta-variable groups when the language is
+  ; being defined, #f afterwards -- name checking only has to happen once, at
+  ; the grammar; a table entry read back later (by `extends`, say) is already
+  ; known good.
+  (define (pretty-plan lead untagged? field-shapes metas pretty)
+    (cond
+      [(not pretty)
+       (append (if untagged? '() (list (list 'lit lead)))
+               (for/list ([fs (in-list field-shapes)]) (list 'field fs #f)))]
+      [else
+       (define (bad! msg) (raise-syntax-error 'define-language msg pretty))
+       (unless (syntax->list pretty)
+         (bad! "a `=>` pretty form must be a parenthesized form"))
+       (define (want-of fs)
+         (case (sx-field-shape-tag fs) [(scalar) 'slot] [(list) 'slot*] [(tuple-list) 'tuple]))
+       (define (show want)
+         (case want [(slot) "`,x`"] [(slot*) "`,x ...`"] [(tuple) "`[,x ,y] ...`"]))
+       (define (slot-metas item)
+         (case (car item)
+           [(slot slot*) (list (cadr item))]
+           [(tuple) (for/list ([one (in-list (cadr item))] #:when (eq? (car one) 'comp)) (cadr one))]))
+       (let loop ([items (pretty-template-items pretty)]
+                  [shapes field-shapes]
+                  [groups (or metas (map (lambda (_) #f) field-shapes))]
+                  [acc '()])
+         (cond
+           [(null? items)
+            (unless (null? shapes)
+              (bad! (format "pretty form is missing a slot for ~a of the case's fields -- every field has to appear, in order"
+                            (length shapes))))
+            (reverse acc)]
+           [(eq? (car (car items)) 'lit)
+            (loop (cdr items) shapes groups (cons (car items) acc))]
+           [else
+            (when (null? shapes)
+              (bad! "pretty form has more slots than the case has fields"))
+            (define fs (car shapes))
+            (define want (want-of fs))
+            (unless (eq? (car (car items)) want)
+              (bad! (format "pretty form's slots don't line up with the case's fields -- expected ~a here, for the case's ~a field"
+                            (show want) (sx-field-shape-tag fs))))
+            (define group (car groups))
+            (when group
+              (define got (slot-metas (car items)))
+              (unless (and (= (length got) (length group))
+                           (for/and ([g (in-list got)] [w (in-list group)])
+                             (eq? (syntax-e g) (syntax-e w))))
+                (bad! (format "pretty form must use the case's own meta-variables, in the case's order -- expected ~a, got ~a (only the literals may move)"
+                              (map syntax-e group) (map syntax-e got)))))
+            (loop (cdr items) (cdr shapes) (cdr groups)
+                  (cons (list 'field fs (and (eq? want 'tuple) (cadr (car items)))) acc))]))]))
+
+  (define (plan-lit? piece) (eq? (car piece) 'lit))
+  (define (plan-lit-datum piece) (cadr piece))
+  (define (plan-field-shape piece) (cadr piece))
+  (define (plan-field-inner piece) (caddr piece))
+  ; the plan of a case entry, straight from the table
+  (define (case-entry-plan ce)
+    (define-values (lead ctor field-shapes pretty) (sx-case-entry-parts ce))
+    (pretty-plan lead (sx-untagged-lead? lead) field-shapes #f pretty)))
+
 ; unparser
 (begin-for-syntax
+  ; case-entry ::= (lead ctor (field-shape ...) pretty-or-#f)
   (define (sx-case-entry-parts ce)
-    (syntax-parse ce [(lead:id ctor:id (fs ...)) (values #'lead #'ctor (syntax->list #'(fs ...)))]))
+    (syntax-parse ce
+      [(lead:id ctor:id (fs ...) pretty)
+       (values #'lead #'ctor (syntax->list #'(fs ...))
+               (and (syntax-e #'pretty) #'pretty))]))
   (define (sx-field-shape-tag fs) (syntax-e (car (syntax->list fs))))
   (define (sx-field-shape-rest fs) (cdr (syntax->list fs))) ; scalar/list: 1 type; tuple-list: N types
 
@@ -235,13 +395,23 @@
   ; inference loses track of `one`'s type through the nested `match`, and
   ; mis-signals the whole `for/list` as producing zero-or-multiple values
   ; instead of one.
-  (define (sx-tuple-list-part v tys nt-syms self-id)
+  (define (sx-tuple-list-part v tys inner nt-syms self-id)
     (define comps (for/list ([_ (in-list tys)]) (generate-temporary 'c)))
     (define converted
       (for/list ([c (in-list comps)] [ty (in-list tys)])
         (if (sx-nonterminal-type? ty nt-syms) #`(#,self-id #,c) c)))
+    ; a `[,x = ,e] ...` pretty form puts literals inside each tuple too
+    (define elems
+      (if inner
+          (let loop ([items inner] [cs converted] [acc '()])
+            (cond
+              [(null? items) (reverse acc)]
+              [(plan-lit? (car items))
+               (loop (cdr items) cs (cons #`(quote #,(plan-lit-datum (car items))) acc))]
+              [else (loop (cdr items) (cdr cs) (cons (car cs) acc))]))
+          converted))
     #`(list (for/list : (Listof Any) ([one : (List #,@tys) (in-list #,v)])
-              (match one [(list #,@comps) (list #,@converted)]))))
+              (match one [(list #,@comps) (list #,@elems)]))))
 
   ; an untagged case's lead-id is never user-written -- it's always
   ; untagged-id's reserved-prefixed output -- so it's printed with no tag
@@ -249,21 +419,30 @@
   ; instead of leaking the internal key.
   (define (sx-untagged-lead? lead) (string-prefix? (symbol->string (syntax-e lead)) "#%untagged:"))
 
-  ; one `[(Ctor f ...) (append (list 'lead) part ...)]` match clause (or,
-  ; for an untagged case, `(append part ...)` with no lead at all)
+  ; one `[(Ctor f ...) (append part ...)]` match clause, one part per piece
+  ; of the case's plan -- a literal (the lead, or anything a pretty form
+  ; interleaves) prints as itself, a field through its own converter
   (define (sx-build-case-clause ce nt-syms self-id)
-    (define-values (lead ctor field-shapes) (sx-case-entry-parts ce))
+    (define-values (lead ctor field-shapes pretty) (sx-case-entry-parts ce))
     (define field-vars (for/list ([_ (in-list field-shapes)]) (generate-temporary 'f)))
     (define parts
-      (for/list ([fs (in-list field-shapes)] [v (in-list field-vars)])
-        (define rest (sx-field-shape-rest fs))
-        (case (sx-field-shape-tag fs)
-          [(scalar) (sx-scalar-part v (car rest) nt-syms self-id)]
-          [(list) (sx-list-part v (car rest) nt-syms self-id)]
-          [(tuple-list) (sx-tuple-list-part v rest nt-syms self-id)])))
-    (if (sx-untagged-lead? lead)
-        #`[(#,ctor #,@field-vars) (append #,@parts)]
-        #`[(#,ctor #,@field-vars) (append (list (quote #,lead)) #,@parts)]))
+      (let loop ([plan (pretty-plan lead (sx-untagged-lead? lead) field-shapes #f pretty)]
+                 [vars field-vars] [acc '()])
+        (cond
+          [(null? plan) (reverse acc)]
+          [(plan-lit? (car plan))
+           (loop (cdr plan) vars (cons #`(list (quote #,(plan-lit-datum (car plan)))) acc))]
+          [else
+           (define fs (plan-field-shape (car plan)))
+           (define rest (sx-field-shape-rest fs))
+           (define part
+             (case (sx-field-shape-tag fs)
+               [(scalar) (sx-scalar-part (car vars) (car rest) nt-syms self-id)]
+               [(list) (sx-list-part (car vars) (car rest) nt-syms self-id)]
+               [(tuple-list) (sx-tuple-list-part (car vars) rest (plan-field-inner (car plan))
+                                                 nt-syms self-id)]))
+           (loop (cdr plan) (cdr vars) (cons part acc))])))
+    #`[(#,ctor #,@field-vars) (append #,@parts)])
 
   ; (build-lang->sexp-def name-id table) -> syntax
   ;
@@ -331,56 +510,75 @@
   ; `[,x ,e] ...` -- one sexp element, a list of arity-N tuples. `assert
   ; list?` is what tells Typed Racket the `Any` this matched really is a
   ; list; the inner `match` does the same job for each tuple's own shape.
-  (define (px-tuple-list-conv v tys nt-syms lang-id who pred-for)
+  (define (px-tuple-list-conv v tys inner nt-syms lang-id who pred-for)
     (define one (generate-temporary 'one))
     (define comps (for/list ([_ (in-list tys)]) (generate-temporary 'c)))
     (define converted
       (for/list ([c (in-list comps)] [ty (in-list tys)])
         (px-scalar-conv c ty nt-syms lang-id who pred-for)))
+    ; the printed tuple carries whatever literals a `[,x = ,e] ...` pretty
+    ; form put between the components, so match those back out too
+    (define pats
+      (if inner
+          (let loop ([items inner] [cs comps] [acc '()])
+            (cond
+              [(null? items) (reverse acc)]
+              [(plan-lit? (car items))
+               (loop (cdr items) cs (cons #`(quote #,(plan-lit-datum (car items))) acc))]
+              [else (loop (cdr items) (cdr cs) (cons (car cs) acc))]))
+          comps))
     #`(for/list : (Listof (List #,@tys)) ([#,one : Any (in-list (assert #,v list?))])
         (match #,one
-          [(list #,@comps) (list #,@converted)]
-          [_ (error '#,who "expected a ~a-element tuple, got: ~e" #,(length tys) #,one)])))
+          [(list #,@pats) (list #,@converted)]
+          [_ (error '#,who "expected a ~a-element tuple, got: ~e" #,(length pats) #,one)])))
 
-  ; one `[(list 'lead pat ...) (Ctor arg ...)]` match clause (for an untagged
-  ; case, `(list pat ...)` with no lead -- mirroring how the unparser prints
-  ; it with no tag). A `,e ...` field contributes `pat ...` to the pattern,
-  ; every other field contributes exactly one pattern, which is what makes
-  ; the positions line up with what <lang>->sexp emitted.
+  ; one `[(list pat ...) (Ctor arg ...)]` match clause, read off the same
+  ; plan the printer used: a literal matches itself, a `,e ...` field
+  ; contributes `pat ...`, every other field exactly one pattern -- which is
+  ; what makes the positions line up with what <lang>->sexp emitted.
   (define (px-build-case-clause ce nt-syms lang-id who pred-for)
-    (define-values (lead ctor field-shapes) (sx-case-entry-parts ce))
-    (define untagged? (sx-untagged-lead? lead))
+    (define-values (lead ctor field-shapes pretty) (sx-case-entry-parts ce))
+    (define plan (pretty-plan lead (sx-untagged-lead? lead) field-shapes #f pretty))
     (cond
       ; two `...` fields in one case can't be split back apart from the
       ; printed form (and `match` won't take two ellipses in one list
-      ; pattern either) -- a tagged case still gets a clause, so the failure
-      ; names the case instead of just the nonterminal. An untagged one has
-      ; no lead to recognize it by, so it gets no clause at all and falls
-      ; through to the nonterminal-level error below.
+      ; pattern either) -- a case whose printed form starts with a literal
+      ; still gets a clause, so the failure names the case instead of just
+      ; the nonterminal. One that starts with a field has nothing to
+      ; recognize it by, so it gets no clause at all and falls through to
+      ; the nonterminal-level error below.
       [(> (length (filter px-list-field? field-shapes)) 1)
-       (and (not untagged?)
-            #`[(list-rest (quote #,lead) _)
+       (and (pair? plan) (plan-lit? (car plan))
+            #`[(list-rest (quote #,(plan-lit-datum (car plan))) _)
                (error '#,who
                       "case ~a has more than one `...` field -- sexp-> can't parse it back unambiguously"
                       '#,lead)])]
       [else
        (define field-vars (for/list ([_ (in-list field-shapes)]) (generate-temporary 'f)))
-       (define pats
-         (apply append
-           (for/list ([fs (in-list field-shapes)] [v (in-list field-vars)])
-             ; `...` reaches the pattern as spliced data, never as template
-             ; text -- a `#'` template would read it as an ellipsis instead
-             (if (px-list-field? fs) (list v (datum->syntax lang-id '...)) (list v)))))
-       (define args
-         (for/list ([fs (in-list field-shapes)] [v (in-list field-vars)])
-           (define rest (sx-field-shape-rest fs))
-           (case (sx-field-shape-tag fs)
-             [(scalar) (px-scalar-conv v (car rest) nt-syms lang-id who pred-for)]
-             [(list) (px-list-conv v (car rest) nt-syms lang-id who pred-for)]
-             [(tuple-list) (px-tuple-list-conv v rest nt-syms lang-id who pred-for)])))
-       (if untagged?
-           #`[(list #,@pats) (#,ctor #,@args)]
-           #`[(list (quote #,lead) #,@pats) (#,ctor #,@args)])]))
+       (define-values (pats args)
+         (let loop ([plan plan] [vars field-vars] [pats '()] [args '()])
+           (cond
+             [(null? plan) (values (reverse pats) (reverse args))]
+             [(plan-lit? (car plan))
+              (loop (cdr plan) vars (cons #`(quote #,(plan-lit-datum (car plan))) pats) args)]
+             [else
+              (define fs (plan-field-shape (car plan)))
+              (define rest (sx-field-shape-rest fs))
+              (define v (car vars))
+              (define arg
+                (case (sx-field-shape-tag fs)
+                  [(scalar) (px-scalar-conv v (car rest) nt-syms lang-id who pred-for)]
+                  [(list) (px-list-conv v (car rest) nt-syms lang-id who pred-for)]
+                  [(tuple-list) (px-tuple-list-conv v rest (plan-field-inner (car plan))
+                                                    nt-syms lang-id who pred-for)]))
+              ; `...` reaches the pattern as spliced data, never as template
+              ; text -- a `#'` template would read it as an ellipsis instead
+              (loop (cdr plan) (cdr vars)
+                    (if (px-list-field? fs)
+                        (cons (datum->syntax lang-id '...) (cons v pats))
+                        (cons v pats))
+                    (cons arg args))])))
+       #`[(list #,@pats) (#,ctor #,@args)]]))
 
   ; (build-sexp->lang-defs lang-id table) -> syntax
   ;
@@ -411,16 +609,18 @@
         (define fn-id (px-parser-id lang-id (syntax-e nt-name)))
         (define nt-type (px-nt-type-id lang-id nt-name))
         (define x (generate-temporary 'sexp))
-        ; the untagged case's pattern has no lead to tell it apart by, so it
-        ; goes after every tagged one -- otherwise `(Var x)` would parse as
-        ; an application of `Var` in a language that has both
-        (define (untagged-case? ce)
-          (define-values (lead _ctor _fs) (sx-case-entry-parts ce))
-          (sx-untagged-lead? lead))
-        (define all-cases (ext-nt-entry-cases nt-entry))
-        (define ordered-cases
-          (append (filter (lambda (ce) (not (untagged-case? ce))) all-cases)
-                  (filter untagged-case? all-cases)))
+        ; clauses are tried most self-identifying first: a printed form that
+        ; starts with a literal names itself, one that merely contains a
+        ; literal (`(,x : ,ty)`) is told apart by that, and the untagged
+        ; case -- all fields, no literals -- matches any list of its length,
+        ; so it goes last. Otherwise `(Var x)` would parse as an application
+        ; of `Var` in a language that has both.
+        (define (case-rank ce)
+          (define plan (case-entry-plan ce))
+          (cond [(and (pair? plan) (plan-lit? (car plan))) 0]
+                [(ormap plan-lit? plan) 1]
+                [else 2]))
+        (define ordered-cases (sort (ext-nt-entry-cases nt-entry) < #:key case-rank))
         (define case-clauses
           (filter values
                   (for/list ([ce (in-list ordered-cases)])
@@ -443,7 +643,10 @@
       (terminals t*:ty-meta ...)
       rules:rule ...)
    (define rule-names (stx-map (prefix-id #'lang _) #'(rules.name ...)))
-   (define all-cases (map flatten-rule-cases (attribute rules.case*)))
+   ; (cases . pretty-forms) per rule -- see split-rule-body
+   (define split* (for/list ([body (in-list (attribute rules.body))]) (split-rule-body body)))
+   (define all-cases (for/list ([one (in-list split*)]) #`(#,@(apply append (car one)))))
+   (define all-pretties (map cdr split*))
    ; quasisyntax + unsyntax-splicing, not a nested `#'` template: a rule may
    ; contain a literal `...` (from `,e ...`), which a nested `#'` would
    ; re-interpret as ellipsis instead of data
@@ -458,11 +661,12 @@
               (add-scope #'((rules.meta ...) ...) lang-scope)
               rule-names)
      (define rule-results
-       (stx-map (rule/expand _ _ _ _)
-                (add-scope #`(#,@all-cases) lang-scope)
-                #`(#,@all-cases)
-                rule-names
-                (attribute rules.name)))
+       (for/list ([scoped (in-list (syntax->list (add-scope #`(#,@all-cases) lang-scope)))]
+                  [raw (in-list all-cases)]
+                  [nm (in-list rule-names)]
+                  [orig (in-list (attribute rules.name))]
+                  [pretties (in-list all-pretties)])
+         (rule/expand scoped raw nm orig pretties)))
      ; flattened the same way `all-cases` is: each result's `car` is itself a
      ; syntax LIST of definitions for that rule, not a single definition
      (define rule-defs (apply append (map (lambda (r) (syntax->list (car r))) rule-results)))
@@ -676,6 +880,71 @@
     (with-app:Expr:#%untagged:with-app:Expr
      (with-app:Expr:Var 'f) (with-app:Expr:Var 'x)))
   (check-equal? (with-app-core->sexp core-app) '((Var f) (Var x)))
+
+  ; `case => pretty-form` -- what the language prints as, and parses back
+  ; from. Only the literals move: the slots are the case's own fields, in the
+  ; case's own order.
+  (define-language pretty
+    (terminals (Integer (n)) (Symbol (x)) (Symbol (ty)))
+    (Bind (b)
+          (bind ,x ,ty) => (,x : ,ty))
+    (Expr (e)
+          ,n
+          (add ,e ,e) => (,e + ,e)
+          (lam ,b ,e) => (fn ,b => ,e)
+          (let ([,x ,e] ...) ,e) => (let* ([,x = ,e] ...) in ,e)
+          (block ,e ...) => (begin ,e ...)))
+
+  (define bd : pretty:Bind (pretty:Bind:bind 'x 'Int))
+  (define sum : pretty:Expr (pretty:Expr:add 1 2))
+  ; a pretty form needs no lead at all -- printing and parsing are driven by
+  ; the literals wherever they sit, not by a leading tag
+  (check-equal? (pretty->sexp bd) '(x : Int))
+  (check-equal? (sexp->pretty:Bind '(x : Int)) bd)
+  (check-equal? (pretty->sexp sum) '(1 + 2))
+  (check-equal? (sexp->pretty:Expr '(1 + 2)) sum)
+  ; a literal may sit anywhere, including between two nonterminal fields
+  (check-equal? (pretty->sexp (pretty:Expr:lam bd sum)) '(fn (x : Int) => (1 + 2)))
+  (check-equal? (sexp->pretty:Expr '(fn (x : Int) => (1 + 2))) (pretty:Expr:lam bd sum))
+  ; ellipsis fields keep their kind: `,e ...` still splices, `[,x ,e] ...` is
+  ; still one element -- with the pretty form's literals inside each tuple
+  (define lets : pretty:Expr (pretty:Expr:let (list (list 'x 1) (list 'y 2)) sum))
+  (check-equal? (pretty->sexp lets) '(let* ((x = 1) (y = 2)) in (1 + 2)))
+  (check-equal? (sexp->pretty:Expr '(let* ((x = 1) (y = 2)) in (1 + 2))) lets)
+  (check-equal? (pretty->sexp (pretty:Expr:block (list 1 2))) '(begin 1 2))
+  (check-equal? (sexp->pretty:Expr '(begin 1 2)) (pretty:Expr:block (list 1 2)))
+  ; `extends` carries a pretty form along with the case it inherits
+  (define-language pretty-core (extends pretty) (Expr (- block)))
+  (check-equal? (pretty-core->sexp lets) '(let* ((x = 1) (y = 2)) in (1 + 2)))
+  (check-equal? (sexp->pretty-core:Expr '(1 + 2)) sum)
+
+  ; only the literals move -- reordering or renaming the slots is a mistake
+  ; the grammar can catch, and does
+  (check-exn #rx"the case's own meta-variables, in the case's order"
+    (lambda ()
+      (convert-compile-time-error
+        (define-language Bad-Order
+          (terminals (Integer (n)) (Symbol (x)) (Symbol (ty)))
+          (Bind (b) (bind ,x ,ty) => (,ty : ,x))))))
+  (check-exn #rx"missing a slot"
+    (lambda ()
+      (convert-compile-time-error
+        (define-language Bad-Missing
+          (terminals (Integer (n)) (Symbol (x)) (Symbol (ty)))
+          (Bind (b) (bind ,x ,ty) => (bind ,x))))))
+  ; a slot's kind has to match the field's: `,e` is not `,e ...`
+  (check-exn #rx"don't line up"
+    (lambda ()
+      (convert-compile-time-error
+        (define-language Bad-Kind
+          (terminals (Integer (n)))
+          (Expr (e) ,n (block ,e ...) => (begin ,e))))))
+  (check-exn #rx"has no form to give"
+    (lambda ()
+      (convert-compile-time-error
+        (define-language Bad-Leaf
+          (terminals (Integer (n)))
+          (Expr (e) ,n => (an-integer ,n))))))
 
   ; a case with two `...` fields can't be split back apart from the printed
   ; form -- it still prints, and says so where it failed when parsed

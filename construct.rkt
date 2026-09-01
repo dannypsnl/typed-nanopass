@@ -31,7 +31,7 @@
         [(_ (ce ...) _)
          (for/or ([one (in-list (syntax->list #'(ce ...)))])
            (syntax-parse one
-             [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) one)]))])))
+             [(lead:id _ _ . _) (and (eq? (syntax-e #'lead) lead-sym) one)]))])))
 
   ; an untagged case's lead-id is always this reserved-prefixed, never
   ; user-typed symbol (see define-language.rkt's untagged-id) -- mirrored
@@ -39,7 +39,7 @@
   ; copy of find-case-entry-anywhere-style lookups instead of importing them
   (define (case-entry-untagged? ce)
     (syntax-parse ce
-      [(lead:id _ _) (string-prefix? (symbol->string (syntax-e #'lead)) "#%untagged:")]))
+      [(lead:id _ _ . _) (string-prefix? (symbol->string (syntax-e #'lead)) "#%untagged:")]))
 
   (define (find-untagged-case-entry-in nt-entry)
     (syntax-parse nt-entry
@@ -80,7 +80,7 @@
                               (format "no case ~a in this language" (syntax-e #'lead))
                               piece))
        (define-values (ctor-id field-shapes)
-         (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+         (syntax-parse ce [(_ ctor:id (fs ...) . _) (values #'ctor (syntax->list #'(fs ...)))]))
        (define args (consume-fields table field-shapes (syntax->list #'(sub-piece ...)) piece))
        #`(#,ctor-id #,@args)]
       ; `(,fn ,arg)` -- untagged nested construction, e.g. an application
@@ -92,7 +92,7 @@
       [(first-piece rest-piece ...)
        (define ce (find-untagged-case-entry-anywhere table piece))
        (define-values (ctor-id field-shapes)
-         (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+         (syntax-parse ce [(_ ctor:id (fs ...) . _) (values #'ctor (syntax->list #'(fs ...)))]))
        (define args (consume-fields table field-shapes (syntax->list #'(first-piece rest-piece ...)) piece))
        #`(#,ctor-id #,@args)]
       [_ (raise-syntax-error 'lang-construct "expected `,expr` or a nested `(lead ...)` shape" piece)]))
@@ -110,9 +110,11 @@
   ; <lang>-meta table (built by define-language.rkt's rule/expand):
   ;   (nt-entry ...)
   ;   nt-entry    ::= (nt-name-id (case-entry ...) (leaf-type ...))
-  ;   case-entry  ::= (lead-id ctor-id (field-shape ...))
+  ;   case-entry  ::= (lead-id ctor-id (field-shape ...) pretty-or-#f)
   ;   field-shape ::= (scalar type) | (list type) | (tuple-list type ...)
-  ; leaf-type isn't used here (only r/match* needs it). lead/nt-name are
+  ; leaf-type isn't used here (only r/match* needs it), nor is the `=>` pretty
+  ; form (only the printer/parser are): building a node reads like the
+  ; grammar, not like the surface syntax the language prints as. lead/nt-name are
   ; compared by symbol, not hygiene -- they're plain labels, not bindings.
   (define (find-nt-entry table nt-sym)
     (for/or ([entry (in-list (syntax->list table))])
@@ -124,7 +126,7 @@
       [(_ (ce ...) _)
        (for/or ([ce (in-list (syntax->list #'(ce ...)))])
          (syntax-parse ce
-           [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) ce)]))]))
+           [(lead:id _ _ . _) (and (eq? (syntax-e #'lead) lead-sym) ce)]))]))
 
   ; consumes pieces left-to-right against field-shapes, one arg expr per
   ; field. tuple-list always takes exactly one piece (self-delimiting: `,@expr`
@@ -236,7 +238,7 @@
                          #'lead))
    (define-values (ctor-id field-shapes)
      (syntax-parse case-entry
-       [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+       [(_ ctor:id (fs ...) . _) (values #'ctor (syntax->list #'(fs ...)))]))
    (define args (consume-fields table field-shapes (syntax->list #'(piece ...)) this-syntax))
    #`(#,ctor-id #,@args)]
   ; `(lang-construct L Expr `(,f ,x))` -- untagged construction. Since
@@ -261,7 +263,7 @@
                          this-syntax))
    (define-values (ctor-id field-shapes)
      (syntax-parse case-entry
-       [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+       [(_ ctor:id (fs ...) . _) (values #'ctor (syntax->list #'(fs ...)))]))
    (define args (consume-fields table field-shapes (syntax->list #'(first-piece more-piece ...)) this-syntax))
    #`(#,ctor-id #,@args)])
 

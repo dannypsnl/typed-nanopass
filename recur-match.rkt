@@ -16,7 +16,7 @@
                (define found
                  (for/or ([one (in-list (syntax->list #'(ce ...)))])
                    (syntax-parse one
-                     [(lead:id _ _) (and (eq? (syntax-e #'lead) lead-sym) one)])))
+                     [(lead:id _ _ . _) (and (eq? (syntax-e #'lead) lead-sym) one)])))
                (and found (list found nt-entry))]))
           (list #f #f)))
     (values (car found-pair) (cadr found-pair)))
@@ -31,9 +31,9 @@
     (for/or ([entry (in-list (syntax->list table))])
       (and (eq? (syntax-e (nt-entry-name entry)) nt-sym) entry)))
 
-  (define (case-entry-lead ce) (syntax-parse ce [(lead:id _ _) (syntax-e #'lead)]))
+  (define (case-entry-lead ce) (syntax-parse ce [(lead:id _ _ . _) (syntax-e #'lead)]))
   (define (case-entry-parts ce)
-    (syntax-parse ce [(lead:id ctor:id (fs ...)) (values #'lead #'ctor (syntax->list #'(fs ...)))]))
+    (syntax-parse ce [(lead:id ctor:id (fs ...) . _) (values #'lead #'ctor (syntax->list #'(fs ...)))]))
   (define (find-case-entry-in nt-entry lead-sym)
     (for/or ([ce (in-list (nt-entry-cases nt-entry))]) (and (eq? (case-entry-lead ce) lead-sym) ce)))
 
@@ -129,7 +129,7 @@
        (unless ce
          (raise-syntax-error 'r/match* (format "no case ~a in this language" (syntax-e #'lead)) pat))
        (define-values (ctor-id field-shapes)
-         (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+         (syntax-parse ce [(_ ctor:id (fs ...) . _) (values #'ctor (syntax->list #'(fs ...)))]))
        (define fields (syntax->list #'(field ...)))
        (define sub-pats (consume-field-patterns table on-id field-shapes fields pat))
        (values (cons 'headed (cons #`(#,ctor-id #,@sub-pats) (case-entry-lead ce))) nt-entry)]
@@ -141,7 +141,7 @@
       [(untagged-fn untagged-rest ...)
        (define-values (ce nt-entry) (find-untagged-case-entry-anywhere table pat))
        (define-values (ctor-id field-shapes)
-         (syntax-parse ce [(_ ctor:id (fs ...)) (values #'ctor (syntax->list #'(fs ...)))]))
+         (syntax-parse ce [(_ ctor:id (fs ...) . _) (values #'ctor (syntax->list #'(fs ...)))]))
        (define fields (cons #'untagged-fn (syntax->list #'(untagged-rest ...))))
        (define sub-pats (consume-field-patterns table on-id field-shapes fields pat))
        (values (cons 'headed (cons #`(#,ctor-id #,@sub-pats) (case-entry-lead ce))) nt-entry)]
